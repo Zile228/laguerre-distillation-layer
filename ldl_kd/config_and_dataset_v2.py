@@ -90,7 +90,7 @@ class Config:
     psi_T_warmup_steps: int = 500  # gradient steps before ψ_T is frozen
 
     # --- Architectures ---
-    teacher_encoder:  str = "resnet34"      # ~24M params total
+    teacher_encoder:  str = "resnet50"      # ~24M params total
     student_encoder:  str = "mobilenet_v2"  # ~4M params total
     encoder_weights:  str = "imagenet"
     # Feature level used for distillation (-2 = penultimate encoder block)
