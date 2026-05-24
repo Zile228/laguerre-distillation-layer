@@ -47,18 +47,19 @@ def build_student(cfg) -> nn.Module:
 
 def get_encoder_feat(model: nn.Module, x: torch.Tensor,
                      feat_idx: int = -2) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Run SMP Unet and return (logit, intermediate_feature).
-    SMP Unet forward: features = encoder(x); dec = decoder(*features); out = head(dec)
-    features is a list of tensors at increasing spatial scales.
-    feat_idx selects which scale to use for distillation.
-    """
     features = model.encoder(x)      # list of tensors
     feat_map = features[feat_idx]    # (B, C, H', W')  ← distillation feature
-    decoder_out = model.decoder(*features)
+    
+    # Xử lý tương thích đa phiên bản cho SMP
+    try:
+        # Dành cho SMP phiên bản cũ
+        decoder_out = model.decoder(*features)
+    except TypeError:
+        # Dành cho SMP phiên bản mới (như trên Kaggle hiện tại)
+        decoder_out = model.decoder(features)
+        
     logit = model.segmentation_head(decoder_out)   # (B, 1, H, W)
     return logit, feat_map
-
 
 # ================================================================
 # SEGMENTATION LOSS (used for all methods)
