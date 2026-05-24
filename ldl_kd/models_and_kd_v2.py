@@ -121,7 +121,7 @@ class VanillaKDLoss(nn.Module):
     the full segmentation output after flattening the spatial dimensions.
     """
 
-    def __init__(self, temperature: float = 4.0):
+    def __init__(self, temperature: float = 2.0):
         super().__init__()
         self.T = temperature
 

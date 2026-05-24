@@ -48,6 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F          # top-level import (was re-imported
                                           # inside loop — moved here)
+from typing import Optional
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm

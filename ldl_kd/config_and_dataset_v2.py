@@ -248,17 +248,6 @@ def get_val_transforms(
         ToTensorV2(),
     ])
 
-def get_val_transforms(
-    img_size: int,
-    mean: Tuple[float, float, float] = _IMAGENET_MEAN,
-    std:  Tuple[float, float, float] = _IMAGENET_STD,
-) -> A.Compose:
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=mean, std=std),
-        ToTensorV2(),
-    ])
-
 
 # ================================================================
 # BUSI DATASET
