@@ -206,20 +206,47 @@ def get_train_transforms(
 ) -> A.Compose:
     return A.Compose([
         A.Resize(img_size, img_size),
+        
+        # --- PREPROCESS CHUYÊN DỤNG CHO SIÊU ÂM ---
+        # Tăng cường độ tương phản cục bộ (giúp làm rõ viền khối u)
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+        
+        # --- AUGMENTATION ---
         A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.3),
+        # Ảnh vú siêu âm thường không lật ngược từ trên xuống dưới trong thực tế y khoa, 
+        # nhưng nếu tập dữ liệu nhỏ bạn có thể giữ VerticalFlip(p=0.2)
+        A.VerticalFlip(p=0.2), 
         A.RandomRotate90(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15,
-                           rotate_limit=30, p=0.5),
+                           rotate_limit=30, p=0.5, border_mode=0), # border_mode=0 để thêm viền đen thay vì nội suy
+        
         A.ElasticTransform(alpha=120, sigma=120 * 0.05,
                            alpha_affine=120 * 0.03, p=0.3),
         A.RandomBrightnessContrast(brightness_limit=0.2,
                                    contrast_limit=0.2, p=0.4),
-        A.GaussNoise(var_limit=(10, 50), p=0.3),
+        
+        # Đã sửa: per_channel=False để không bị nhiễu màu cầu vồng. 
+        # Giảm var_limit xuống mức hợp lý để không phá huỷ ảnh.
+        A.GaussNoise(var_limit=(10.0, 30.0), per_channel=False, p=0.3),
+        
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
 
+def get_val_transforms(
+    img_size: int,
+    mean: Tuple[float, float, float] = _IMAGENET_MEAN,
+    std:  Tuple[float, float, float] = _IMAGENET_STD,
+) -> A.Compose:
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        
+        # Validation cũng bắt buộc phải đi qua bước Preprocess giống Train
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+        
+        A.Normalize(mean=mean, std=std),
+        ToTensorV2(),
+    ])
 
 def get_val_transforms(
     img_size: int,
