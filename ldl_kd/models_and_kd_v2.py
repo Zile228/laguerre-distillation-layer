@@ -7,6 +7,13 @@ KD Baselines:
   VanillaKD  — Hinton et al. (2015), soft logit matching
   FitNets    — Romero et al. (2014), intermediate feature L2
   AT         — Zagoruyko & Komodakis (2017), attention map matching
+
+Fix log:
+  VanillaKDLoss.forward() — binary_cross_entropy() is not AMP-safe because
+    torch autocast reduces sigmoid outputs to float16, but BCE requires float32
+    inputs to avoid numerical instability.  The fix casts both tensors to
+    float32 explicitly before the loss computation while still benefiting from
+    the reduced-precision forward pass for everything else.
 """
 
 import torch
@@ -26,7 +33,7 @@ def build_teacher(cfg) -> nn.Module:
         encoder_weights=cfg.encoder_weights,
         in_channels=3,
         classes=1,
-        activation=None,          # raw logits; we apply sigmoid in loss
+        activation=None,          # raw logits; sigmoid applied inside loss
         decoder_channels=(256, 128, 64, 32, 16),
     )
     return model.to(cfg.device)
@@ -45,42 +52,59 @@ def build_student(cfg) -> nn.Module:
     return model.to(cfg.device)
 
 
-def get_encoder_feat(model: nn.Module, x: torch.Tensor,
-                     feat_idx: int = -2) -> Tuple[torch.Tensor, torch.Tensor]:
-    features = model.encoder(x)      # list of tensors
-    feat_map = features[feat_idx]    # (B, C, H', W')  ← distillation feature
-    
-    # Xử lý tương thích đa phiên bản cho SMP
+def get_encoder_feat(
+    model: nn.Module,
+    x: torch.Tensor,
+    feat_idx: int = -2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run a forward pass and return (logit, feature_map).
+
+    feat_idx selects which encoder feature level to use for distillation
+    (-2 = penultimate encoder block).  Handles both old and new SMP APIs.
+    """
+    features = model.encoder(x)          # list of tensors
+    feat_map = features[feat_idx]         # (B, C, H', W')
+
+    # SMP version compatibility: older API unpacks features as *args,
+    # newer API accepts a single list argument.
     try:
-        # Dành cho SMP phiên bản cũ
         decoder_out = model.decoder(*features)
     except TypeError:
-        # Dành cho SMP phiên bản mới (như trên Kaggle hiện tại)
         decoder_out = model.decoder(features)
-        
+
     logit = model.segmentation_head(decoder_out)   # (B, 1, H, W)
     return logit, feat_map
+
 
 # ================================================================
 # SEGMENTATION LOSS (used for all methods)
 # ================================================================
 class SegLoss(nn.Module):
     """Dice + BCE combined loss (standard for medical segmentation)."""
+
     def __init__(self, bce_weight: float = 0.5):
         super().__init__()
         self.bce_weight  = bce_weight
         self.dice_weight = 1.0 - bce_weight
-        self.bce = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCEWithLogitsLoss()   # AMP-safe; works on logits directly
 
-    def dice_loss(self, pred_logit: torch.Tensor,
-                  target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        pred = torch.sigmoid(pred_logit)
+    def dice_loss(
+        self,
+        pred_logit: torch.Tensor,
+        target: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        pred  = torch.sigmoid(pred_logit)
         inter = (pred * target).sum(dim=(1, 2, 3))
         denom = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
         return 1.0 - (2 * inter + eps) / (denom + eps)
 
-    def forward(self, pred_logit: torch.Tensor,
-                target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pred_logit: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
         bce  = self.bce(pred_logit, target)
         dice = self.dice_loss(pred_logit, target).mean()
         return self.bce_weight * bce + self.dice_weight * dice
@@ -92,15 +116,31 @@ class SegLoss(nn.Module):
 class VanillaKDLoss(nn.Module):
     """
     Soft-logit knowledge distillation.
-    KL( σ(teacher/T) ‖ σ(student/T) ) scaled by T².
-    Applied to segmentation maps after flattening spatial dims.
+
+    Computes KL( σ(teacher/T) ‖ σ(student/T) ) scaled by T², applied to
+    the full segmentation output after flattening the spatial dimensions.
+
+    AMP safety
+    ----------
+    torch.nn.functional.binary_cross_entropy() (and BCELoss) are *not*
+    safe to use under torch.autocast because the sigmoid output may be in
+    float16, which does not have sufficient precision near 0 and 1.
+    PyTorch's own error message recommends combining sigmoid + BCE into
+    binary_cross_entropy_with_logits(), but here both sides are already
+    probabilities (not logits), so instead we cast both tensors to float32
+    before the BCE call.  This cast is cheap — it only affects the KD
+    scalar loss computation — and restores numerical correctness.
     """
+
     def __init__(self, temperature: float = 4.0):
         super().__init__()
         self.T = temperature
 
-    def forward(self, student_logit: torch.Tensor,
-                teacher_logit: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        student_logit: torch.Tensor,
+        teacher_logit: torch.Tensor,
+    ) -> torch.Tensor:
         B = student_logit.shape[0]
         s = (student_logit / self.T).reshape(B, -1)
         t = (teacher_logit / self.T).reshape(B, -1).detach()
@@ -109,8 +149,14 @@ class VanillaKDLoss(nn.Module):
         p_t = torch.sigmoid(t)   # teacher soft probability
         p_s = torch.sigmoid(s)   # student soft probability
 
-        # KL divergence for binary case: sum over pixels
-        loss = F.binary_cross_entropy(p_s, p_t, reduction="mean")
+        # ── AMP-safe BCE ────────────────────────────────────────────────────
+        # Cast to float32 before binary_cross_entropy because float16 lacks
+        # the precision to represent probabilities very close to 0 or 1,
+        # causing NaN / inf gradients under autocast.
+        # Equivalent to the standard KL divergence for binary distributions.
+        loss = F.binary_cross_entropy(
+            p_s.float(), p_t.float(), reduction="mean"
+        )
         return loss * (self.T ** 2)
 
 
@@ -120,20 +166,27 @@ class VanillaKDLoss(nn.Module):
 class FitNetsLoss(nn.Module):
     """
     L2 feature matching with a learned linear projector.
-    Projector maps student channels → teacher channels.
+    Projects student channels → teacher channels before MSE.
     """
-    def __init__(self, student_channels: int, teacher_channels: int,
-                 device: str = "cpu"):
+
+    def __init__(
+        self,
+        student_channels: int,
+        teacher_channels: int,
+        device: str = "cpu",
+    ):
         super().__init__()
         self.projector = nn.Sequential(
             nn.Conv2d(student_channels, teacher_channels, 1, bias=False),
             nn.BatchNorm2d(teacher_channels),
         ).to(device)
 
-    def forward(self, feat_s: torch.Tensor,
-                feat_t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        feat_s: torch.Tensor,
+        feat_t: torch.Tensor,
+    ) -> torch.Tensor:
         feat_t = feat_t.detach()
-        # Align spatial size if needed
         if feat_s.shape[-2:] != feat_t.shape[-2:]:
             feat_s = F.interpolate(feat_s, size=feat_t.shape[-2:],
                                    mode="bilinear", align_corners=False)
@@ -147,22 +200,26 @@ class FitNetsLoss(nn.Module):
 class ATLoss(nn.Module):
     """
     Attention map matching.
-    Attention map A(F) = L2-normalised sum of squared activations.
-    Loss = ‖ A(teacher) - A(student) ‖₂
+    Attention map A(F) = L2-normalised sum of squared channel activations.
+    Loss = ‖ A(teacher) − A(student) ‖₂
     """
+
     def __init__(self):
         super().__init__()
 
     @staticmethod
     def attention_map(feat: torch.Tensor) -> torch.Tensor:
         """feat: (B, C, H, W) → attention: (B, 1, H, W), L2-normalised."""
-        a = feat.pow(2).sum(dim=1, keepdim=True)      # (B, 1, H, W)
+        a      = feat.pow(2).sum(dim=1, keepdim=True)   # (B, 1, H, W)
         a_flat = a.reshape(a.shape[0], -1)
         a_norm = a_flat / (a_flat.norm(dim=1, keepdim=True) + 1e-8)
         return a_norm.reshape_as(a)
 
-    def forward(self, feat_s: torch.Tensor,
-                feat_t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        feat_s: torch.Tensor,
+        feat_t: torch.Tensor,
+    ) -> torch.Tensor:
         feat_t = feat_t.detach()
         if feat_s.shape[-2:] != feat_t.shape[-2:]:
             feat_s = F.interpolate(feat_s, size=feat_t.shape[-2:],
@@ -175,39 +232,50 @@ class ATLoss(nn.Module):
 # ================================================================
 # KD METHOD REGISTRY
 # ================================================================
-def build_kd_loss(method: str, cfg, teacher_ch: int,
-                  student_ch: int) -> Optional[nn.Module]:
+def build_kd_loss(
+    method: str,
+    cfg,
+    teacher_ch: int,
+    student_ch: int,
+) -> Optional[nn.Module]:
     """
     Return the KD loss module for the given method name.
     Returns None for 'none' (student trained standalone).
     """
     if method == "none":
         return None
+
     elif method == "vanilla":
         return VanillaKDLoss(cfg.temperature).to(cfg.device)
+
     elif method == "fitnets":
         return FitNetsLoss(student_ch, teacher_ch,
                            cfg.device).to(cfg.device)
+
     elif method == "at":
         return ATLoss().to(cfg.device)
+
     elif method == "ldl":
         # Revised LDL module (ldl_layer_v2) with five reviewer fixes applied.
         from ldl_layer_v2 import LaguerreDistillationLayer
         return LaguerreDistillationLayer(
-            teacher_channels=teacher_ch,
-            student_channels=student_ch,
-            embed_dim=cfg.ldl_embed_dim,
-            num_anchors=cfg.ldl_num_anchors,
-            alpha=cfg.ldl_alpha,
-            k=cfg.ldl_k,
-            a1=cfg.ldl_a1, b1=cfg.ldl_b1,
-            a2=cfg.ldl_a2, b2=cfg.ldl_b2,
-            T_w=cfg.ldl_T_w,
-            eta0=cfg.ldl_eta0,
-            beta=cfg.ldl_beta,
-            anc_reg=cfg.ldl_anc_reg,
-            anc_reg_tau=cfg.ldl_anc_reg_tau,   # Issue 4 fix: soft-min τ
-            device=cfg.device,
+            teacher_channels = teacher_ch,
+            student_channels = student_ch,
+            embed_dim        = cfg.ldl_embed_dim,
+            num_anchors      = cfg.ldl_num_anchors,
+            alpha            = cfg.ldl_alpha,
+            k                = cfg.ldl_k,
+            a1               = cfg.ldl_a1,
+            b1               = cfg.ldl_b1,
+            a2               = cfg.ldl_a2,
+            b2               = cfg.ldl_b2,
+            T_w              = cfg.ldl_T_w,
+            eta0             = cfg.ldl_eta0,
+            beta             = cfg.ldl_beta,
+            anc_reg          = cfg.ldl_anc_reg,
+            anc_reg_tau      = cfg.ldl_anc_reg_tau,   # Issue 4 fix: soft-min τ
+            device           = cfg.device,
         ).to(cfg.device)
+
     else:
         raise ValueError(f"Unknown KD method: {method!r}")
