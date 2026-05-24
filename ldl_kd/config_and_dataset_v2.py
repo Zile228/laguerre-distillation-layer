@@ -227,7 +227,7 @@ def get_train_transforms(
         
         # Đã sửa: per_channel=False để không bị nhiễu màu cầu vồng. 
         # Giảm var_limit xuống mức hợp lý để không phá huỷ ảnh.
-        A.GaussNoise(var_limit=(10.0, 30.0), per_channel=False, p=0.3),
+        A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=False, p=0.3),
         
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
