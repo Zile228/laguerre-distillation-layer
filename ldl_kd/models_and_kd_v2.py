@@ -1,5 +1,5 @@
 """
-models_and_kd.py — Model Factory + All KD Baseline Losses
+models_and_kd_v2.py — Model Factory + All KD Baseline Losses
 Architectures:
   Teacher : ResNet34-UNet   (~24M params, ResNet34 encoder)
   Student : MobileV2-UNet   (~4M  params, MobileNetV2 encoder)  ← edge-deployable
@@ -119,17 +119,6 @@ class VanillaKDLoss(nn.Module):
 
     Computes KL( σ(teacher/T) ‖ σ(student/T) ) scaled by T², applied to
     the full segmentation output after flattening the spatial dimensions.
-
-    AMP safety
-    ----------
-    torch.nn.functional.binary_cross_entropy() (and BCELoss) are *not*
-    safe to use under torch.autocast because the sigmoid output may be in
-    float16, which does not have sufficient precision near 0 and 1.
-    PyTorch's own error message recommends combining sigmoid + BCE into
-    binary_cross_entropy_with_logits(), but here both sides are already
-    probabilities (not logits), so instead we cast both tensors to float32
-    before the BCE call.  This cast is cheap — it only affects the KD
-    scalar loss computation — and restores numerical correctness.
     """
 
     def __init__(self, temperature: float = 4.0):
@@ -145,17 +134,15 @@ class VanillaKDLoss(nn.Module):
         s = (student_logit / self.T).reshape(B, -1)
         t = (teacher_logit / self.T).reshape(B, -1).detach()
 
-        # Binary segmentation → sigmoid soft labels
-        p_t = torch.sigmoid(t)   # teacher soft probability
-        p_s = torch.sigmoid(s)   # student soft probability
+        # Binary segmentation → sigmoid soft labels (chỉ tính cho teacher)
+        p_t = torch.sigmoid(t)
 
         # ── AMP-safe BCE ────────────────────────────────────────────────────
-        # Cast to float32 before binary_cross_entropy because float16 lacks
-        # the precision to represent probabilities very close to 0 or 1,
-        # causing NaN / inf gradients under autocast.
-        # Equivalent to the standard KL divergence for binary distributions.
-        loss = F.binary_cross_entropy(
-            p_s.float(), p_t.float(), reduction="mean"
+        # F.binary_cross_entropy bị cấm tuyệt đối khi dùng PyTorch autocast.
+        # Sử dụng F.binary_cross_entropy_with_logits thay thế (AMP-safe) 
+        # bằng cách truyền trực tiếp logit của student (s).
+        loss = F.binary_cross_entropy_with_logits(
+            s, p_t.float(), reduction="mean"
         )
         return loss * (self.T ** 2)
 
