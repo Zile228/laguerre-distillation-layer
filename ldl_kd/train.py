@@ -328,7 +328,7 @@ def run_method(method: str, cfg: Config):
         params += list(kd_loss_fn.parameters())
     optimizer = optim.Adam(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", patience=cfg.lr_patience, factor=0.5, verbose=True
+        optimizer, mode="max", patience=cfg.lr_patience, factor=0.5
     )
     scaler = GradScaler(enabled=cfg.amp)
 
