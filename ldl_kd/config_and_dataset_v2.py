@@ -91,6 +91,9 @@ class Config:
 
     # --- KD global ---
     lambda_kd:   float = 0.5
+    
+    # Path to load pre-trained teacher weights
+    teacher_ckpt: Optional[str] = None
 
     # Fix 1: temperature reduced from 4.0 → 2.0.
     # VanillaKDLoss no longer applies T² scaling (removed in models_and_kd_v2.py).

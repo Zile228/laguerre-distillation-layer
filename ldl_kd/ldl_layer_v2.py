@@ -7,60 +7,39 @@ Implements Algorithms 1–3 from the proposal, grounded in:
 Revision log (addressing reviewer feedback):
 ─────────────────────────────────────────────────────────────────────────────
 Issue 1 [CRITICAL] — Radial cost assumption (Definition 3.2, base paper)
-    OLD: c(p, y_i) = α‖p_sp − y_sp‖² + (1−α)(1 − cos⟨p_feat, y_feat⟩)
-         The cosine term depends on the *content* of φ(p), not just d(p, y_i),
-         so the combined cost is NOT radial and Theorems 3.3, Prop 3.1–3.2
-         do not apply.
-    FIX: Embed both sides onto the unit (D−1)-sphere before computing L2²:
+    FIXED: Embed both sides onto the unit (D−1)-sphere before computing L2²:
          c(p̂, ŷ_i) = α‖p_sp − y_sp‖² + (1−α)‖p̂_feat − ŷ_feat‖²
          where  p̂_feat = normalize(φ(p)),  ŷ_feat = normalize(y_feat).
          The augmented point lives in ℝ² × 𝕊^{D−1} ⊂ ℝ^{D+2} and the cost
          is c = g(d) with g(t) = t², d = weighted Euclidean on ℝ^{D+2}.
          This satisfies Definition 3.2 (strictly increasing g, radial in a
-         product metric space). Note: ‖n_a − n_b‖² = 2(1 − cos⟨n_a, n_b⟩),
-         so the change is a constant rescaling of (1−α), not a loss of
-         semantic discriminability.
+         product metric space). Note: ‖n_a − n_b‖² = 2(1 − cos⟨n_a, n_b⟩).
+         
+    *NEW FIX*: The same radial, properly normalized, and alpha-weighted 
+    distance metric used in `_cost_matrix` is now transposed and utilized 
+    to drive the soft-min anchor regularization `d_anc`.
 
-Issue 2 [SIGNIFICANT] — Prop. 3.2 operates at w = 0 vs. operational w*
-    OLD: Gradient claimed to follow Prop. 3.2 exactly, but Prop. 3.2 requires
-         masses set at w = 0 cells (C_i(0)), while training uses w* cells.
-    FIX: The code retains the autograd graph through V = kC − w*ᵀ and applies
-         a stop-gradient (straight-through estimator) only on the cell-
-         assignment argmin, so gradients actually flow through C_i(w*) — the
-         dual-weight-adjusted cells. This is a straight-through approximation
-         of the exact gradient at w*, acknowledged explicitly in the docstring.
-         It is strictly more accurate than using C_i(0) when w* ≠ 0 (which
-         occurs exactly in the high-imbalance regime the method targets).
+Issue 2 [CRITICAL] — Prop. 3.2 operates at w = 0 vs. operational w* & OT Mass Fix
+    *NEW FIX*: `update_masses` now takes an explicit optimal mass tensor.
+    The per-image accumulation of optimal transport assignments (fractions 
+    of pixels per anchor) is now handled mathematically correctly inside 
+    `_ldl_update_masses` within `train.py`.
 
 Issue 3 [SIGNIFICANT] — Straight-through estimator not disclosed
-    FIX: Fully documented in forward() and in the module docstring. Language
+    FIXED: Fully documented in forward() and in the module docstring. Language
          in the proposal ("exact closed-form gradient") updated to
          ("straight-through approximation of the Proposition 3.2 gradient").
 
 Issue 4 [SIGNIFICANT] — ℓ_anc-reg: min_j is non-differentiable
-    OLD: l_anc_reg = (1/M) Σ_i  min_j ‖y_feat_i − f̂_S_{j,feat}‖²
-         The hard min has sub-gradients only at the attaining index; PyTorch's
-         autograd returns zero gradient elsewhere, creating dead anchors.
-    FIX: Replace with a soft-min (negative log-sum-exp of negative distances):
+    FIXED: Replace with a soft-min (negative log-sum-exp of negative distances):
          softmin_τ(d) = −τ · log Σ_j exp(−d_{ij}/τ)
          This is smooth, lower-bounds the hard min (softmin → min as τ→0),
          and provides dense gradients to all anchor-feature pairs.
-         Temperature τ = 0.1 is registered as a hyperparameter.
 
 Issue 5 [SIGNIFICANT] — k-means++ runs BEFORE ψ_T warm-up
-    OLD: warmup_anchors() called on random ψ_T embeddings; after 500-step
-         warm-up ψ_T changes, leaving anchors misaligned with the frozen
-         embedding space.
-    FIX: warmup_anchors() must be called AFTER ψ_T is frozen (i.e., after
+    FIXED: warmup_anchors() must be called AFTER ψ_T is frozen (i.e., after
          the warm-up phase). A runtime guard (_psi_T_frozen flag) enforces
-         this and raises a descriptive error if violated.
-
-v3 config note (no code changes to this module):
-    embed_dim   default 128 → 256 in Config (passed at construction time)
-    num_anchors default 32  → 64  in Config (passed at construction time)
-    These values are controlled by cfg.ldl_embed_dim / cfg.ldl_num_anchors
-    and forwarded through build_kd_loss() in models_and_kd_v2.py.
-    The module accepts any (embed_dim, num_anchors) pair; no internal change.
+         this.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -92,27 +71,13 @@ class LaguerreDistillationLayer(nn.Module):
     Anchor regulariser — smooth soft-min:
         ℓ_anc-reg uses negative log-sum-exp (soft-min with temperature τ)
         instead of hard argmin, giving dense, everywhere-defined gradients.
+        (Now accurately utilizing the correctly scaled radial cost metric).
 
     Initialisation order:
         1. Instantiate LDL.
         2. Warm up ψ_T for ~500 gradient steps and FREEZE it.
         3. Call warmup_anchors() — this requires _psi_T_frozen = True.
         4. Begin joint LDL + student training.
-
-    Args:
-        teacher_channels : channel width of teacher distillation feature map
-        student_channels : channel width of student distillation feature map
-        embed_dim        : shared projection dimension D
-        num_anchors      : number of Laguerre anchors M
-        alpha            : spatial vs. semantic cost weight ∈ (0,1)
-        k                : transport-cost scale factor
-        a1, b1           : newsvendor TV parameters, supply (teacher) side
-        a2, b2           : newsvendor TV parameters, demand (student) side
-        T_w              : inner dual-solver steps per batch
-        eta0, beta       : decaying step-size η_t = η0·(1+t)^{−β}
-        anc_reg          : anchor regularisation weight γ
-        anc_reg_tau      : soft-min temperature for ℓ_anc-reg (Issue 4 fix)
-        device           : torch device string
     """
 
     def __init__(
@@ -247,7 +212,7 @@ class LaguerreDistillationLayer(nn.Module):
         Args:
             C_mean : (N, M)  cost matrix averaged over the batch (detached)
         Returns:
-            w*     : (M,)    updated dual weights
+            w* : (M,)    updated dual weights
         """
         w    = self.w.clone()
         N, M = C_mean.shape
@@ -278,15 +243,12 @@ class LaguerreDistillationLayer(nn.Module):
     # Mass update — once per epoch  (Theorem 3.5)
     # ====================================================================
     @torch.no_grad()
-    def update_masses(self, C_mean: torch.Tensor):
+    def update_masses(self, new_masses: torch.Tensor):
         """
         m_i ← |C_i(w) ∩ Ω| / |Ω|   (optimal mass given current locations).
-        C_mean: (N, M) cost matrix averaged over the training set (detached).
+        Updated mathematically correctly over the entire dataset via train.py.
         """
-        V     = self.k * C_mean - self.w.unsqueeze(0)
-        sigma = V.argmin(dim=1)
-        for i in range(self.M):
-            self.masses[i] = (sigma == i).float().mean().clamp(min=1e-4)
+        self.masses.copy_(new_masses)
 
     # ====================================================================
     # Anchor warmup — k-means++ AFTER ψ_T is frozen  [Issue 5]
@@ -423,21 +385,15 @@ class LaguerreDistillationLayer(nn.Module):
         # Term 3: anchor alignment  Σ_i I₂(w*_i) · m_i
         l_anchor     = (self._I2(self.w.detach()) * self.masses.detach()).sum()
 
-        # ── Step 7: anchor regularisation — smooth soft-min  (Issue 4) ────
-        #    HARD MIN (old): l_anc_reg = min_j ‖y_i − f̂_S_j‖²
-        #      → non-differentiable at the attaining index j*;
-        #        PyTorch returns 0 gradient for j ≠ j*, creating dead anchors.
-        #    SOFT-MIN (new): softmin_τ(d_{ij}) = −τ · log Σ_j exp(−d_{ij}/τ)
-        #      → everywhere differentiable; recovers hard min as τ → 0⁺;
-        #        gives dense gradients to all anchor-student-feature pairs.
+        # ── Step 7: anchor regularisation — smooth soft-min  (Issue 4 Fix) ────
+        #    By passing the augmented student features into `_cost_matrix`
+        #    we identically recreate the properly normalized, alpha-weighted 
+        #    squared distance metric for the student-to-anchor mapping.
         fs_flat = fs.permute(0, 2, 3, 1).reshape(B, N, self.D)  # (B, N, D)
         F_hat_S = torch.cat([fs_flat, P.detach()], dim=-1)       # (B, N, D+2)
 
-        # d_anc[b, i, j] = ‖ŷ_i − f̂_S_{b,j}‖²   (B, M, N)
-        d_anc   = torch.cdist(
-            self.anchors.unsqueeze(0).expand(B, -1, -1),   # (B, M, D+2)
-            F_hat_S,                                        # (B, N, D+2)
-        )                                                   # (B, M, N)
+        C_S = self._cost_matrix(F_hat_S)                         # (B, N, M)
+        d_anc = C_S.transpose(1, 2)                              # (B, M, N)
 
         # Soft-min over j (student positions) for each anchor i
         # = −τ · log Σ_j exp(−d_{ij} / τ)

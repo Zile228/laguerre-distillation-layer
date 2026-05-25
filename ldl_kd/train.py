@@ -15,6 +15,18 @@ Multi-seed workflow (recommended):
 
 Fix log (v2 → v3):
 ─────────────────────────────────────────────────────────────────────────────
+NEW FIXES:
+    - Added "teacher" to ALL_METHODS. Calling `--method all` will now dynamically 
+      train the teacher architecture with the dataset and save the optimal weights, 
+      eliminating the Random Teacher issue.
+    - Repaired `dice_score` and `iou_score` accumulators to utilize a properly 
+      scaled sum instead of the mean, preventing biased Evaluation Metric Aggregation.
+    - Moved random seed instantiation (torch.manual_seed, etc.) immediately inside 
+      run_method() to completely prevent RNG Seed Contamination. 
+    - The OT Mass Calculation in `_ldl_update_masses` now dynamically isolates the 
+      cost matrix logic per-image preventing validly scaled assignments from being
+      smoothed over validation sets prior to the sub-gradient operation.
+
 Fix 1  [Vanilla KD imbalance — train.py side]
     The T² scaling was removed inside VanillaKDLoss (models_and_kd_v2.py).
     No train.py change needed; the loss is now in a balanced range.
@@ -98,14 +110,16 @@ def dice_score(pred_logit, target, threshold=0.5, eps=1e-6):
     pred  = (torch.sigmoid(pred_logit) > threshold).float()
     inter = (pred * target).sum(dim=(1, 2, 3))
     denom = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-    return ((2 * inter + eps) / (denom + eps)).mean().item()
+    # Corrected to sum over batch elements for unbiased dataset-level tracking
+    return ((2 * inter + eps) / (denom + eps)).sum().item()
 
 
 def iou_score(pred_logit, target, threshold=0.5, eps=1e-6):
     pred  = (torch.sigmoid(pred_logit) > threshold).float()
     inter = (pred * target).sum(dim=(1, 2, 3))
     union = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) - inter
-    return ((inter + eps) / (union + eps)).mean().item()
+    # Corrected to sum over batch elements for unbiased dataset-level tracking
+    return ((inter + eps) / (union + eps)).sum().item()
 
 
 class HD95Meter:
@@ -259,10 +273,13 @@ def _ldl_warmup_psi_T(kd_loss_fn, teacher, train_loader, cfg):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _ldl_update_masses(kd_loss_fn, teacher, val_loader, cfg):
-    """Recompute anchor masses m_i ← |C_i(w) ∩ Ω| / |Ω| (Theorem 3.5)."""
+    """
+    Recompute anchor masses m_i ← |C_i(w) ∩ Ω| / |Ω| (Theorem 3.5).
+    Correctly aggregates per-image instance optimal assignments over the dataset.
+    """
     teacher.eval()
-    C_accum = None
-    cnt = 0
+    mass_accum = torch.zeros(kd_loss_fn.M, device=cfg.device)
+    total_samples = 0
     with torch.no_grad():
         for imgs, _ in val_loader:
             imgs    = imgs.to(cfg.device, non_blocking=True)
@@ -277,11 +294,19 @@ def _ldl_update_masses(kd_loss_fn, teacher, val_loader, cfg):
                       .reshape(N, 2).unsqueeze(0).expand(B, -1, -1))
             ft_flat = ft_proj.permute(0, 2, 3, 1).reshape(B, N, kd_loss_fn.D)
             F_hat   = torch.cat([ft_flat, P], dim=-1)
-            C_batch = kd_loss_fn._cost_matrix(F_hat).mean(0)
-            C_accum = C_batch if C_accum is None else C_accum + C_batch
-            cnt += 1
-    if C_accum is not None and cnt > 0:
-        kd_loss_fn.update_masses(C_accum / cnt)
+            
+            C_batch = kd_loss_fn._cost_matrix(F_hat) # (B, N, M)
+            V = kd_loss_fn.k * C_batch - kd_loss_fn.w.unsqueeze(0).unsqueeze(0)
+            sigma = V.argmin(dim=2) # (B, N)
+            
+            for i in range(kd_loss_fn.M):
+                # Calculate assigned percentage per image, then sum across batch
+                mass_accum[i] += (sigma == i).float().mean(dim=1).sum()
+            total_samples += B
+            
+    if total_samples > 0:
+        new_masses = (mass_accum / total_samples).clamp(min=1e-4)
+        kd_loss_fn.update_masses(new_masses)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -313,9 +338,10 @@ def train_one_epoch(
         teacher.eval()
 
     total_loss = total_seg = total_kd = 0.0
-    n_batches  = 0
+    n_samples  = 0
 
     for imgs, masks in loader:
+        B = imgs.shape[0]
         imgs  = imgs.to(cfg.device,  non_blocking=True)
         masks = masks.to(cfg.device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -371,15 +397,16 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item()
-        total_seg  += l_seg.item()
-        total_kd   += l_kd.item() if isinstance(l_kd, torch.Tensor) else l_kd
-        n_batches  += 1
+        total_loss += loss.item() * B
+        total_seg  += l_seg.item() * B
+        l_kd_val = l_kd.item() if isinstance(l_kd, torch.Tensor) else l_kd
+        total_kd   += l_kd_val * B
+        n_samples  += B
 
     return {
-        "loss": total_loss / n_batches,
-        "seg":  total_seg  / n_batches,
-        "kd":   total_kd   / n_batches,
+        "loss": total_loss / n_samples,
+        "seg":  total_seg  / n_samples,
+        "kd":   total_kd   / n_samples,
     }
 
 
@@ -393,8 +420,10 @@ def evaluate(model, loader, cfg):
     seg_loss_fn = SegLoss().to(cfg.device)
     hd95_meter  = HD95Meter(cfg.device)
     total_dice = total_iou = total_loss = 0.0
-    n = 0
+    n_samples = 0
+    
     for imgs, masks in loader:
+        B = imgs.shape[0]
         imgs  = imgs.to(cfg.device,  non_blocking=True)
         masks = masks.to(cfg.device, non_blocking=True)
         with autocast(enabled=cfg.amp):
@@ -402,13 +431,14 @@ def evaluate(model, loader, cfg):
             loss      = seg_loss_fn(logit, masks)
         total_dice += dice_score(logit, masks)
         total_iou  += iou_score(logit, masks)
-        total_loss += loss.item()
+        total_loss += loss.item() * B
         hd95_meter.update(logit, masks)
-        n += 1
+        n_samples += B
+        
     return {
-        "loss": total_loss / n,
-        "dice": total_dice / n,
-        "iou":  total_iou  / n,
+        "loss": total_loss / n_samples,
+        "dice": total_dice / n_samples,
+        "iou":  total_iou  / n_samples,
         "hd95": hd95_meter.compute(),
     }
 
@@ -426,22 +456,38 @@ def run_method(method: str, cfg: Config):
     Per-seed JSON : {results_dir}/{method}_seed{seed}_metrics.json
     """
     seed = cfg.seed
+    
+    # Fix 3: RNG Reseeding to avoid global RNG contamination
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
     print(f"\n{'='*65}")
     print(f"  METHOD: {method.upper()}   SEED: {seed}")
     print(f"{'='*65}")
 
     train_loader, val_loader, test_loader = build_dataloaders(cfg)
 
-    teacher = build_teacher(cfg)
-    student = build_student(cfg)
+    if method == "teacher":
+        teacher = None
+        student = build_teacher(cfg, load_ckpt=False)
+    else:
+        teacher = build_teacher(cfg, load_ckpt=True)
+        student = build_student(cfg)
 
     # Detect feature channel widths dynamically (architecture-agnostic)
     with torch.no_grad():
         dummy = torch.randn(2, 3, cfg.img_size, cfg.img_size, device=cfg.device)
-        _, t_feat_sample = get_encoder_feat(teacher, dummy, cfg.distill_feat_idx)
+        if teacher is not None:
+            _, t_feat_sample = get_encoder_feat(teacher, dummy, cfg.distill_feat_idx)
+            teacher_ch = t_feat_sample.shape[1]
+        else:
+            teacher_ch = 0
+            
         _, s_feat_sample = get_encoder_feat(student, dummy, cfg.distill_feat_idx)
-    teacher_ch = t_feat_sample.shape[1]
-    student_ch = s_feat_sample.shape[1]
+        student_ch = s_feat_sample.shape[1]
+        
     print(f"  Teacher distill channels : {teacher_ch}")
     print(f"  Student distill channels : {student_ch}")
 
@@ -743,8 +789,12 @@ def run_benchmark_only(cfg: Config):
                 seed_val = int(seed_str)
             except ValueError:
                 seed_val = 0   # legacy checkpoint without seed
-
-            student = build_student(cfg)
+                
+            if method == "teacher":
+                student = build_teacher(cfg, load_ckpt=False)
+            else:
+                student = build_student(cfg)
+                
             ckpt    = torch.load(ckpt_path, map_location=cfg.device)
             student.load_state_dict(ckpt["student"])
 
@@ -772,7 +822,7 @@ def run_benchmark_only(cfg: Config):
 
         # Fix 3: teacher metrics for 'none' method
         if method == "none":
-            teacher = build_teacher(cfg)
+            teacher = build_teacher(cfg, load_ckpt=True)
             print("  Evaluating teacher on test set …")
             tt = evaluate(teacher, test_loader, cfg)
             ops_t = benchmark_model(teacher, cfg, label="teacher")
@@ -798,7 +848,7 @@ def run_benchmark_only(cfg: Config):
 # Entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ALL_METHODS = ["none", "vanilla", "fitnets", "at", "ldl"]
+ALL_METHODS = ["teacher", "none", "vanilla", "fitnets", "at", "ldl"]
 
 
 def parse_args():
@@ -827,12 +877,6 @@ def main():
     if args.batch_size is not None: cfg.batch_size = args.batch_size
     if args.lambda_kd  is not None: cfg.lambda_kd  = args.lambda_kd
     cfg.seed = args.seed
-
-    # Seed everything reproducibly
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
 
     print(f"\n  Device : {cfg.device}")
     print(f"  AMP    : {cfg.amp}")
