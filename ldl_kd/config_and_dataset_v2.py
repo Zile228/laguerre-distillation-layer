@@ -19,7 +19,7 @@ Fix 2  [Multi-seed support]
 Fix 3  [Teacher test metrics]
     No config change required; handled entirely in train.py.
 
-Fix 4  [LDL hyperparameter defaults for ResNet50 + ShuffleNetV2]
+Fix 4  [LDL hyperparameter defaults for ResNet50 + MobileNetV2]
     ldl_embed_dim   : 128 → 256   (ResNet50 feat_idx=-2 outputs 1024ch;
                                    D=256 gives a richer projection target)
     ldl_num_anchors : 32  → 64    (more anchors → finer Laguerre partition
@@ -32,8 +32,9 @@ Fix 5  [λ_LDL ramp-up]
     observed at epoch 25 in the v2 run.
 
 Architecture change:
-    Teacher : ResNet50-UNet   (~32M params)   — was ResNet34
-    Student : ShuffleNetV2-x1.0-UNet (~3.5M) — was MobileNetV2
+    Teacher : ResNet50-UNet    (~32M params)  — was ResNet34
+    Student : MobileNetV2-UNet (~3.5M params) — Reverted back from ShuffleNetV2
+                                                due to timm missing the model.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -124,15 +125,14 @@ class Config:
     # --- Architectures ---
     # Teacher: ResNet50-UNet, ~32 M params — stronger backbone than ResNet34.
     teacher_encoder: str = "resnet50"
-    # Student: ShuffleNetV2 x1.0-UNet, ~3.5 M params — replaces MobileNetV2.
-    #   'tu-' prefix selects SMP's timm-backed encoder registry (SMP >= 0.3.3).
-    #   ShuffleNetV2 x1.0 has lower latency than MobileNetV2 on ARM/NPU hardware
-    #   and is more amenable to channel-shuffle INT8 quantisation.
-    student_encoder: str = "tu-shufflenet_v2_x1_0"
+    # Student: MobileNetV2-UNet, ~3.5 M params.
+    #   Reverted from ShuffleNetV2 (tu-shufflenet_v2_x1_0) because timm does not
+    #   have a shufflenet_v2_x1_0 model, leading to a RuntimeError.
+    student_encoder: str = "mobilenet_v2"
     encoder_weights: str = "imagenet"
     # Penultimate encoder block used for distillation.
-    # ResNet50  feat_idx=-2 → Layer3 → 1024 channels
-    # ShuffleV2 feat_idx=-2 → Stage3 →  232 channels  (auto-detected at runtime)
+    # ResNet50    feat_idx=-2 → Layer3 → 1024 channels
+    # MobileNetV2 feat_idx=-2 →        →   96 channels (auto-detected at runtime)
     distill_feat_idx: int = -2
 
     # --- Efficiency benchmark ---

@@ -2,11 +2,10 @@
 models_and_kd_v2.py — Model Factory + All KD Baseline Losses
 
 Architectures:
-  Teacher : ResNet50-UNet   (~32 M params, ResNet50 encoder)  ← upgraded from ResNet34
-  Student : ShuffleNetV2-x1.0-UNet (~3.5 M params)           ← replaces MobileNetV2
-            Accessed via SMP timm integration (encoder_name='tu-shufflenet_v2_x1_0').
-            ShuffleNetV2 x1.0 is ~15 % faster than MobileNetV2 on ARM/NPU hardware
-            and supports channel-shuffle-aware INT8 quantisation.
+  Teacher : ResNet50-UNet    (~32 M params, ResNet50 encoder)  ← upgraded from ResNet34
+  Student : MobileNetV2-UNet (~3.5 M params)                   ← Reverted from ShuffleNetV2
+            (ShuffleNetV2 via timm 'tu-shufflenet_v2_x1_0' resulted in a RuntimeError 
+            because it is not natively supported in the timm registry).
 
 KD Baselines:
   VanillaKD  — Hinton et al. (2015), soft logit matching
@@ -65,17 +64,14 @@ def build_teacher(cfg) -> nn.Module:
 
 def build_student(cfg) -> nn.Module:
     """
-    ShuffleNetV2 x1.0-UNet student.
+    MobileNetV2-UNet student.
 
-    ShuffleNetV2 x1.0 distillation channels (feat_idx=-2):
-      Stage3 output → ~232 channels (auto-detected at runtime in run_method).
+    MobileNetV2 distillation channels (feat_idx=-2):
+      ~96 channels (auto-detected at runtime in run_method).
     Total params with UNet decoder (128,64,32,16,8): ~3.5 M.
-
-    The 'tu-' prefix uses SMP's timm-backed encoder registry (SMP >= 0.3.3).
-    encoder_weights="imagenet" downloads timm pretrained weights automatically.
     """
     model = smp.Unet(
-        encoder_name=cfg.student_encoder,        # "tu-shufflenet_v2_x1_0"
+        encoder_name=cfg.student_encoder,        # "mobilenet_v2"
         encoder_weights=cfg.encoder_weights,
         in_channels=3,
         classes=1,
