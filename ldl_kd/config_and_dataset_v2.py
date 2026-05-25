@@ -1,17 +1,40 @@
 """
-config.py + dataset.py — BUSI Dataset Configuration and Loader
+config_and_dataset_v2.py — BUSI Dataset Configuration and Loader
 Handles the standard BUSI layout from:
   Al-Dhabyani W et al. "Dataset of breast ultrasound images." Data in Brief, 2020.
-Kaggle
 
-Changes (v2 → v3):
-  • Multi-mask merging: images with extra lesion masks (e.g. benign (1)_mask_1.png)
-    are now handled correctly — all sibling masks are OR-merged at load time.
-  • Dataset statistics: compute_dataset_stats() computes per-channel mean/std from
-    the actual training images in a single pass.  build_dataloaders() calls it
-    automatically when cfg.img_mean / cfg.img_std are None.
-  • get_train_transforms / get_val_transforms now accept mean/std parameters so
-    the normalisation uses the computed (or user-supplied) statistics.
+Revision log (v2 → v3 — five targeted fixes):
+─────────────────────────────────────────────────────────────────────────────
+Fix 1  [Vanilla KD imbalance]
+    cfg.temperature reduced from 4.0 → 2.0.  The T² loss scaling in
+    VanillaKDLoss (removed in models_and_kd_v2.py) was compounding with T=4
+    to inflate the KD term by 16×.  At T=2 the soft-label effect is meaningful
+    while T²=4 leaves λ_kd as the sole balance knob.
+
+Fix 2  [Multi-seed support]
+    cfg.seeds  (List[int], default [42, 123, 456]) specifies which random seeds
+    to train over.  train.py's --seed flag controls the active seed per run;
+    benchmark_only mode aggregates all per-seed checkpoints automatically.
+
+Fix 3  [Teacher test metrics]
+    No config change required; handled entirely in train.py.
+
+Fix 4  [LDL hyperparameter defaults for ResNet50 + ShuffleNetV2]
+    ldl_embed_dim   : 128 → 256   (ResNet50 feat_idx=-2 outputs 1024ch;
+                                   D=256 gives a richer projection target)
+    ldl_num_anchors : 32  → 64    (more anchors → finer Laguerre partition
+                                   covering BUSI lesion boundaries better)
+
+Fix 5  [λ_LDL ramp-up]
+    ldl_lambda_ramp_epochs : int = 10   (new field)
+    The effective KD weight ramps from 0 → λ_kd linearly over the first N
+    epochs after the ψ_T warm-up phase.  This prevents the abrupt loss spike
+    observed at epoch 25 in the v2 run.
+
+Architecture change:
+    Teacher : ResNet50-UNet   (~32M params)   — was ResNet34
+    Student : ShuffleNetV2-x1.0-UNet (~3.5M) — was MobileNetV2
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -34,26 +57,25 @@ from albumentations.pytorch import ToTensorV2
 @dataclass
 class Config:
     # --- Paths ---
-    data_root:    str = "./BUSI"
-    ckpt_dir:     str = "./checkpoints"
-    results_dir:  str = "./results"
-    log_dir:      str = "./logs"
+    data_root:   str = "./BUSI"
+    ckpt_dir:    str = "./checkpoints"
+    results_dir: str = "./results"
+    log_dir:     str = "./logs"
 
     # --- Data ---
-    img_size:     int   = 256
-    batch_size:   int   = 8
-    num_workers:  int   = 2
-    train_split:  float = 0.70
-    val_split:    float = 0.15   # test = 1 - train - val
-    seed:         int   = 42
-    use_classes:  tuple = ("benign", "malignant")  # exclude "normal" (no lesion)
+    img_size:    int   = 256
+    batch_size:  int   = 8
+    num_workers: int   = 2
+    train_split: float = 0.70
+    val_split:   float = 0.15      # test = 1 − train − val
+    seed:        int   = 42        # active seed for one run
+    use_classes: tuple = ("benign", "malignant")
 
-    # Normalisation statistics.
-    # Set to None to compute automatically from the training set at runtime
-    # (recommended for medical images which differ from ImageNet statistics).
-    # Set to explicit tuples to skip computation:
-    #   img_mean = (0.485, 0.456, 0.406)
-    #   img_std  = (0.229, 0.224, 0.225)
+    # Fix 2: multi-seed list.  Each value is passed as --seed to a separate
+    # train.py invocation.  benchmark_only mode aggregates all seeds.
+    seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
+
+    # Normalisation statistics — None → computed from training images at runtime.
     img_mean: Optional[Tuple[float, float, float]] = None
     img_std:  Optional[Tuple[float, float, float]] = None
 
@@ -61,43 +83,60 @@ class Config:
     epochs:       int   = 100
     lr:           float = 1e-4
     weight_decay: float = 1e-5
-    lr_patience:  int   = 15    # ReduceLROnPlateau patience
+    lr_patience:  int   = 15       # ReduceLROnPlateau patience
     grad_clip:    float = 1.0
-    amp:          bool  = True  # mixed-precision (T4/P100 both support it)
-    early_stop:   int   = 25    # stop if val Dice doesn't improve
+    amp:          bool  = True
+    early_stop:   int   = 25
 
     # --- KD global ---
-    lambda_kd:    float = 0.5   # weight on KD loss  (Lseg + λ·Lkd)
-    temperature:  float = 4.0   # vanilla KD temperature
+    lambda_kd:   float = 0.5
 
-    # --- LDL hyperparameters (Section 4.1 of paper) ---
-    ldl_embed_dim:   int   = 128
-    ldl_num_anchors: int   = 32
-    ldl_alpha:       float = 0.5   # spatial vs semantic cost balance
-    ldl_k:           float = 1.0   # transport cost scale
-    ldl_a1:          float = 0.30  # TV over-supply penalty
-    ldl_b1:          float = 0.10  # TV under-supply penalty
-    ldl_a2:          float = 1.00  # TV over-demand penalty
-    ldl_b2:          float = 0.20  # TV under-demand penalty
-    ldl_T_w:         int   = 15    # dual solver steps per batch
-    ldl_eta0:        float = 0.05  # dual solver initial step size
-    ldl_beta:        float = 0.60  # dual solver step size decay exponent
-    ldl_anc_reg:     float = 0.01  # anchor regularisation weight γ
-    ldl_anc_reg_tau: float = 0.10  # soft-min temperature τ (Issue 4 fix)
+    # Fix 1: temperature reduced from 4.0 → 2.0.
+    # VanillaKDLoss no longer applies T² scaling (removed in models_and_kd_v2.py).
+    # At T=2 the soft-label smoothing is still meaningful; T²=4 is benign.
+    temperature: float = 2.0
 
-    # --- ψ_T warm-up (Issue 5 fix: k-means++ runs AFTER this many steps) ---
-    # Set to 0 to skip warm-up (not recommended).
-    psi_T_warmup_steps: int = 500  # gradient steps before ψ_T is frozen
+    # --- LDL hyperparameters ---
+    # Fix 4: embed_dim 128 → 256 (ResNet50 distil feats are 1024ch; D=256 richer)
+    ldl_embed_dim:   int   = 256
+    # Fix 4: num_anchors 32 → 64 (finer Laguerre partition for boundary coverage)
+    ldl_num_anchors: int   = 64
+    ldl_alpha:       float = 0.5    # spatial vs. semantic cost balance
+    ldl_k:           float = 1.0    # transport-cost scale
+    ldl_a1:          float = 0.30   # TV over-supply penalty
+    ldl_b1:          float = 0.10   # TV under-supply penalty
+    ldl_a2:          float = 1.00   # TV over-demand penalty
+    ldl_b2:          float = 0.20   # TV under-demand penalty
+    ldl_T_w:         int   = 15     # dual-solver inner steps per batch
+    ldl_eta0:        float = 0.05   # dual-solver initial step size
+    ldl_beta:        float = 0.60   # dual-solver step-size decay exponent
+    ldl_anc_reg:     float = 0.01   # anchor regularisation weight γ
+    ldl_anc_reg_tau: float = 0.10   # soft-min temperature τ (Issue 4 fix)
+
+    # Fix 5: λ_LDL ramp-up.  The effective KD weight scales linearly from 0
+    # to lambda_kd over this many epochs AFTER the ψ_T warm-up completes.
+    # Set to 0 to use a hard switch (v2 behaviour, causes a loss spike).
+    ldl_lambda_ramp_epochs: int = 10
+
+    # --- ψ_T warm-up (Issue 5 — k-means++ runs AFTER this many steps) ---
+    psi_T_warmup_steps: int = 500
 
     # --- Architectures ---
-    teacher_encoder:  str = "resnet50"      # ~24M params total
-    student_encoder:  str = "mobilenet_v2"  # ~4M params total
-    encoder_weights:  str = "imagenet"
-    # Feature level used for distillation (-2 = penultimate encoder block)
+    # Teacher: ResNet50-UNet, ~32 M params — stronger backbone than ResNet34.
+    teacher_encoder: str = "resnet50"
+    # Student: ShuffleNetV2 x1.0-UNet, ~3.5 M params — replaces MobileNetV2.
+    #   'tu-' prefix selects SMP's timm-backed encoder registry (SMP >= 0.3.3).
+    #   ShuffleNetV2 x1.0 has lower latency than MobileNetV2 on ARM/NPU hardware
+    #   and is more amenable to channel-shuffle INT8 quantisation.
+    student_encoder: str = "tu-shufflenet_v2_x1_0"
+    encoder_weights: str = "imagenet"
+    # Penultimate encoder block used for distillation.
+    # ResNet50  feat_idx=-2 → Layer3 → 1024 channels
+    # ShuffleV2 feat_idx=-2 → Stage3 →  232 channels  (auto-detected at runtime)
     distill_feat_idx: int = -2
 
     # --- Efficiency benchmark ---
-    benchmark_repeats: int = 200  # forward-pass repetitions for latency
+    benchmark_repeats: int = 200
     benchmark_warmup:  int = 20
 
     # --- Device ---
@@ -119,25 +158,10 @@ def compute_dataset_stats(
     seed:        int = 42,
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     """
-    Compute per-channel pixel mean and standard deviation from a random
-    sample of the dataset images (no masks, no augmentation).
+    Compute per-channel pixel mean and std from a random sample of images.
 
-    Uses a single-pass accumulation of Σx and Σx² over all pixels, so
-    memory cost is O(1) regardless of dataset size.
-
-    Args:
-        data_root   : path to BUSI root (handles both layout variants).
-        img_size    : images are resized to (img_size × img_size) before
-                      accumulation so that the statistics match the input
-                      resolution actually used during training.
-        classes     : which class sub-directories to scan.
-        max_samples : maximum number of images to use (random sample if
-                      the dataset is larger).
-        seed        : random seed for the subsample selection.
-
-    Returns:
-        (mean, std)  where each is a 3-tuple (R, G, B) of float values
-        in [0, 1].  Falls back to ImageNet defaults if no images are found.
+    Uses single-pass accumulation of Σx and Σx² (O(1) memory regardless of
+    dataset size).  Falls back to ImageNet defaults if no images are found.
     """
     root = Path(data_root)
     candidate = root / "Dataset_BUSI_with_GT"
@@ -162,25 +186,24 @@ def compute_dataset_stats(
     sample = (all_imgs if len(all_imgs) <= max_samples
               else rng.sample(all_imgs, max_samples))
 
-    # Single-pass accumulation: E[x] and E[x²] → mean, std
-    sum_   = np.zeros(3, dtype=np.float64)
-    sum2_  = np.zeros(3, dtype=np.float64)
-    n_pix  = 0
+    sum_  = np.zeros(3, dtype=np.float64)
+    sum2_ = np.zeros(3, dtype=np.float64)
+    n_pix = 0
 
     for path in sample:
         img = np.array(
             Image.open(path).convert("RGB").resize(
                 (img_size, img_size), Image.BILINEAR),
             dtype=np.float64
-        ) / 255.0                         # (H, W, 3) in [0, 1]
-        pixels  = img.reshape(-1, 3)      # (H*W, 3)
+        ) / 255.0
+        pixels  = img.reshape(-1, 3)
         sum_   += pixels.sum(axis=0)
         sum2_  += (pixels ** 2).sum(axis=0)
         n_pix  += pixels.shape[0]
 
     mean = sum_ / n_pix
     var  = sum2_ / n_pix - mean ** 2
-    std  = np.sqrt(np.maximum(var, 1e-8))  # guard against numerical noise
+    std  = np.sqrt(np.maximum(var, 1e-8))
 
     mean_t = tuple(float(v) for v in mean)
     std_t  = tuple(float(v) for v in std)
@@ -206,32 +229,24 @@ def get_train_transforms(
 ) -> A.Compose:
     return A.Compose([
         A.Resize(img_size, img_size),
-        
-        # --- PREPROCESS CHUYÊN DỤNG CHO SIÊU ÂM ---
-        # Tăng cường độ tương phản cục bộ (giúp làm rõ viền khối u)
+        # CLAHE: local contrast enhancement — critical for US boundary clarity
         A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
-        
-        # --- AUGMENTATION ---
+        # Spatial augmentations
         A.HorizontalFlip(p=0.5),
-        # Ảnh vú siêu âm thường không lật ngược từ trên xuống dưới trong thực tế y khoa, 
-        # nhưng nếu tập dữ liệu nhỏ bạn có thể giữ VerticalFlip(p=0.2)
-        A.VerticalFlip(p=0.2), 
+        A.VerticalFlip(p=0.2),
         A.RandomRotate90(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15,
-                           rotate_limit=30, p=0.5, border_mode=0), # border_mode=0 để thêm viền đen thay vì nội suy
-        
+                           rotate_limit=30, p=0.5, border_mode=0),
         A.ElasticTransform(alpha=120, sigma=120 * 0.05,
                            alpha_affine=120 * 0.03, p=0.3),
+        # Intensity augmentations
         A.RandomBrightnessContrast(brightness_limit=0.2,
                                    contrast_limit=0.2, p=0.4),
-        
-        # Đã sửa: per_channel=False để không bị nhiễu màu cầu vồng. 
-        # Giảm var_limit xuống mức hợp lý để không phá huỷ ảnh.
         A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=False, p=0.3),
-        
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
+
 
 def get_val_transforms(
     img_size: int,
@@ -240,10 +255,7 @@ def get_val_transforms(
 ) -> A.Compose:
     return A.Compose([
         A.Resize(img_size, img_size),
-        
-        # Validation cũng bắt buộc phải đi qua bước Preprocess giống Train
         A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
-        
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
@@ -256,52 +268,37 @@ class BUSIDataset(Dataset):
     """
     BUSI (Breast Ultrasound Images) Dataset.
 
-    Expected directory structure (either variant is handled):
-      Variant A (flat per-class folders):
-        data_root/benign/benign (1).png
-        data_root/benign/benign (1)_mask.png
-        data_root/benign/benign (1)_mask_1.png   ← extra lesion, handled!
-
-      Variant B (Dataset_BUSI_with_GT layout):
-        data_root/Dataset_BUSI_with_GT/benign/benign (1).png
-        data_root/Dataset_BUSI_with_GT/benign/benign (1)_mask.png
+    Supported directory layouts:
+      Variant A:  data_root/benign/benign (1).png + benign (1)_mask.png
+      Variant B:  data_root/Dataset_BUSI_with_GT/benign/...
 
     Multi-mask support
     ------------------
-    Some BUSI images contain more than one lesion, each annotated as a
-    separate mask file:
-        benign (100)_mask.png     ← primary mask
-        benign (100)_mask_1.png   ← additional lesion
-        benign (100)_mask_2.png   ← yet another lesion
-
-    All sibling masks for an image are merged with a pixel-wise maximum
-    (logical OR), producing a single binary mask that covers every
-    annotated lesion region.  This prevents silently ignoring lesions and
-    matches clinical practice where all lesions should be segmented.
+    Images with multiple annotated lesions have sibling mask files:
+        benign (100)_mask.png, benign (100)_mask_1.png, ...
+    All sibling masks are merged with pixel-wise maximum (logical OR) so that
+    every annotated lesion contributes to the training signal.
     """
 
     def __init__(
         self,
-        data_root:    str,
-        split:        str   = "train",             # "train" | "val" | "test"
-        transforms:   Optional[A.Compose] = None,
-        classes:      Tuple[str, ...] = ("benign", "malignant"),
-        train_ratio:  float = 0.70,
-        val_ratio:    float = 0.15,
-        seed:         int   = 42,
+        data_root:   str,
+        split:       str   = "train",
+        transforms:  Optional[A.Compose] = None,
+        classes:     Tuple[str, ...] = ("benign", "malignant"),
+        train_ratio: float = 0.70,
+        val_ratio:   float = 0.15,
+        seed:        int   = 42,
     ):
         self.transforms = transforms
-        # Each entry: (img_path: str, mask_paths: List[str])
         self.samples: List[Tuple[str, List[str]]] = []
 
         root = Path(data_root)
-        # Handle Variant B layout
         candidate = root / "Dataset_BUSI_with_GT"
         if candidate.exists():
             root = candidate
 
         all_pairs: List[Tuple[str, List[str]]] = []
-        total_multi = 0   # count images with more than one mask (diagnostic)
 
         for cls in classes:
             cls_dir = root / cls
@@ -318,8 +315,6 @@ class BUSIDataset(Dataset):
             for img_path in imgs:
                 mask_paths = _find_all_masks(img_path)
                 if mask_paths:
-                    if len(mask_paths) > 1:
-                        total_multi += 1
                     all_pairs.append((str(img_path),
                                       [str(m) for m in mask_paths]))
                 else:
@@ -331,10 +326,9 @@ class BUSIDataset(Dataset):
                 "Check that BUSI data is extracted correctly."
             )
 
-        # Deterministic split
         rng = random.Random(seed)
         rng.shuffle(all_pairs)
-        n = len(all_pairs)
+        n       = len(all_pairs)
         n_train = int(n * train_ratio)
         n_val   = int(n * val_ratio)
 
@@ -361,10 +355,6 @@ class BUSIDataset(Dataset):
 
         img = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
 
-        # ── Multi-mask merge (pixel-wise maximum = logical OR) ──────────────
-        # Primary mask is always mask_paths[0].  Additional lesion masks
-        # (mask_paths[1], mask_paths[2], …) are merged in so that all
-        # annotated regions contribute equally to the training signal.
         mask = np.zeros(
             np.array(Image.open(mask_paths[0]).convert("L"),
                      dtype=np.uint8).shape,
@@ -374,13 +364,12 @@ class BUSIDataset(Dataset):
             m    = np.array(Image.open(mp).convert("L"), dtype=np.uint8)
             mask = np.maximum(mask, m)
 
-        # Binarise (some BUSI masks store 0 / 255 instead of 0 / 1)
         mask = (mask > 127).astype(np.uint8)
 
         if self.transforms:
             aug  = self.transforms(image=img, mask=mask)
-            img  = aug["image"]                          # (3, H, W) float tensor
-            mask = aug["mask"].unsqueeze(0).float()      # (1, H, W)
+            img  = aug["image"]
+            mask = aug["mask"].unsqueeze(0).float()
         else:
             img  = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
             mask = torch.from_numpy(mask[None]).float()
@@ -392,36 +381,18 @@ class BUSIDataset(Dataset):
 # PRIVATE HELPER — find all mask files for one image
 # ================================================================
 def _find_all_masks(img_path: Path) -> List[Path]:
-    """
-    Return all mask files associated with *img_path*, sorted consistently.
-
-    Searches for:
-        <stem>_mask<suffix>          → primary mask  (always first if present)
-        <stem>_mask_1<suffix>        → 1st extra lesion
-        <stem>_mask_2<suffix>        → 2nd extra lesion
-        … up to _mask_9 (covers all known BUSI variants)
-
-    Example
-    -------
-        img_path = /data/benign/benign (100).png
-        returns  [benign (100)_mask.png,
-                  benign (100)_mask_1.png]   ← if the second file exists
-    """
-    stem   = img_path.stem    # e.g. "benign (100)"
-    suffix = img_path.suffix  # e.g. ".png"
+    stem   = img_path.stem
+    suffix = img_path.suffix
     found: List[Path] = []
 
-    # Primary mask
     primary = img_path.with_name(stem + "_mask" + suffix)
     if primary.exists():
         found.append(primary)
 
-    # Additional lesion masks: _mask_1, _mask_2, …
     for k in range(1, 10):
         extra = img_path.with_name(stem + f"_mask_{k}" + suffix)
         if extra.exists():
             found.append(extra)
-        # Mask files are numbered consecutively, so stop on first miss
         else:
             break
 
@@ -435,12 +406,13 @@ def build_dataloaders(cfg: Config):
     """
     Return (train_loader, val_loader, test_loader).
 
-    If cfg.img_mean / cfg.img_std are None (the default), per-channel
-    mean and standard deviation are computed automatically from a random
-    sample of the training images and stored back into cfg so that
-    the same statistics can be re-used for inference without recomputing.
+    Uses cfg.seed for the dataset split (ensures reproducible splits across
+    seeds — all seeds see the same train/val/test partition, only model
+    initialisation and data-augmentation order differ between seeds).
+
+    If cfg.img_mean / cfg.img_std are None, per-channel statistics are
+    computed automatically and stored back into cfg.
     """
-    # ── Compute or use supplied normalisation statistics ─────────────────────
     if cfg.img_mean is None or cfg.img_std is None:
         print("  Computing dataset normalisation statistics …")
         mean, std = compute_dataset_stats(
@@ -448,26 +420,29 @@ def build_dataloaders(cfg: Config):
             img_size    = cfg.img_size,
             classes     = cfg.use_classes,
             max_samples = 500,
-            seed        = cfg.seed,
+            seed        = 42,   # fixed: stats derived from same image subset
         )
         cfg.img_mean = mean
         cfg.img_std  = std
     else:
         mean, std = cfg.img_mean, cfg.img_std
 
-    # ── Build transforms with the chosen statistics ───────────────────────────
     train_tf = get_train_transforms(cfg.img_size, mean, std)
     val_tf   = get_val_transforms(cfg.img_size, mean, std)
 
+    # NOTE: dataset split uses a fixed seed (42) so the test set is identical
+    # across all training seeds.  Only weight initialisation varies.
+    split_seed = 42
+
     train_ds = BUSIDataset(cfg.data_root, "train", train_tf,
                            cfg.use_classes, cfg.train_split,
-                           cfg.val_split, cfg.seed)
+                           cfg.val_split, split_seed)
     val_ds   = BUSIDataset(cfg.data_root, "val",   val_tf,
                            cfg.use_classes, cfg.train_split,
-                           cfg.val_split, cfg.seed)
+                           cfg.val_split, split_seed)
     test_ds  = BUSIDataset(cfg.data_root, "test",  val_tf,
                            cfg.use_classes, cfg.train_split,
-                           cfg.val_split, cfg.seed)
+                           cfg.val_split, split_seed)
 
     def make_loader(ds, shuffle):
         return DataLoader(

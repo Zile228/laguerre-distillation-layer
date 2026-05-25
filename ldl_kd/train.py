@@ -2,39 +2,51 @@
 train.py — Training, Evaluation, and Benchmarking Runner
 
 Usage:
-    python train.py --method ldl      # LDL distillation
-    python train.py --method vanilla  # Vanilla KD
-    python train.py --method fitnets  # FitNets
-    python train.py --method at       # Attention Transfer
-    python train.py --method none     # Student standalone
-    python train.py --method all      # Run all methods sequentially
-    python train.py --benchmark_only  # Skip training; just benchmark checkpoints
+    python train.py --method ldl   --seed 42   # single run
+    python train.py --method all   --seed 42   # all methods, one seed
+    python train.py --method all   --seed 123  # all methods, second seed
+    python train.py --benchmark_only            # aggregate all saved checkpoints
 
-Metrics logged per epoch  : Dice, IoU, HD95, train loss
-Operational metrics (once): GFLOPs, #Params, Latency (ms), GPU memory
+Multi-seed workflow (recommended):
+    for seed in 42 123 456; do
+        python train.py --method all --seed $seed
+    done
+    python train.py --benchmark_only   # produces mean ± std across seeds
 
-Fix log:
-  • torch.nn.functional (F) moved to top-level import — it was mistakenly
-    re-imported inside the per-epoch LDL mass-update block, which shadowed
-    the module-level name and is a latent bug.
+Fix log (v2 → v3):
+─────────────────────────────────────────────────────────────────────────────
+Fix 1  [Vanilla KD imbalance — train.py side]
+    The T² scaling was removed inside VanillaKDLoss (models_and_kd_v2.py).
+    No train.py change needed; the loss is now in a balanced range.
 
-  • LDL warmup order (Issue 5) — the original code called warmup_anchors()
-    before freeze_psi_T(), triggering a RuntimeError because k-means++ was
-    seeded with random (untrained) ψ_T embeddings that would then drift once
-    the real warm-up began.
+Fix 2  [Multi-seed support]
+    --seed N  controls the random seed for weight initialisation and
+    data-augmentation order.  Dataset splits are always seeded at 42 so
+    the test set is identical across seeds.  Checkpoint and log files are
+    named best_{method}_seed{seed}.pth / {method}_seed{seed}_history.csv.
+    benchmark_only mode scans for all matching checkpoints, evaluates each,
+    and reports mean ± std per method.
 
-    Correct order (implemented below in run_method / _ldl_warmup_psi_T):
-      1. Train ψ_T for cfg.psi_T_warmup_steps gradient steps with a
-         variance-maximising objective so it learns a stable, non-collapsed
-         embedding before anchors are seeded.
-      2. Call ldl.freeze_psi_T()  → sets _psi_T_frozen = True.
-      3. Collect psi_T-projected features from the training loader.
-      4. Call ldl.warmup_anchors(feat_batches) → k-means++ init.
-      5. Begin regular joint training.
+Fix 3  [Teacher test metrics]
+    run_method() now evaluates the frozen teacher on the test set whenever
+    method == 'none' and stores dice/iou/hd95 in the results dict alongside
+    the operational benchmarks.  benchmark_only also evaluates the teacher
+    once (it has no seed-to-seed variation).
+
+Fix 4  [LDL hyperparameters — config side only]
+    embed_dim=256 and num_anchors=64 set in Config; no train.py change.
+
+Fix 5  [λ_LDL ramp-up]
+    train_one_epoch() now accepts an epoch argument.  For the LDL method,
+    the effective KD weight scales from 0 → λ_kd over the first
+    cfg.ldl_lambda_ramp_epochs epochs after the ψ_T warm-up phase.
+    This eliminates the abrupt loss spike previously observed at epoch 25.
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
 import csv
+import glob
 import json
 import os
 import sys
@@ -46,29 +58,25 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F          # top-level import (was re-imported
-                                          # inside loop — moved here)
-from typing import Optional
+import torch.nn.functional as F
+from typing import Dict, List, Optional
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-# ── Monai for HD95 ────────────────────────────────────────────────────────────
 try:
-    from monai.metrics import DiceMetric, HausdorffDistanceMetric
-    from monai.transforms import AsDiscrete
+    from monai.metrics import HausdorffDistanceMetric
     MONAI_OK = True
 except ImportError:
     MONAI_OK = False
-    print("[WARN] monai not found — HD95 will be skipped. pip install monai")
+    print("[WARN] monai not found — HD95 will be skipped.  pip install monai")
 
-# ── THOP for FLOPs ───────────────────────────────────────────────────────────
 try:
     from thop import profile as thop_profile
     THOP_OK = True
 except ImportError:
     THOP_OK = False
-    print("[WARN] thop not found — GFLOPs will be skipped. pip install thop")
+    print("[WARN] thop not found — GFLOPs will be skipped.  pip install thop")
 
 from config_and_dataset_v2 import Config, build_dataloaders
 from models_and_kd_v2 import (
@@ -76,7 +84,6 @@ from models_and_kd_v2 import (
     get_encoder_feat, SegLoss,
 )
 
-# ── Optional LDL import ───────────────────────────────────────────────────────
 try:
     from ldl_layer_v2 import LaguerreDistillationLayer
 except ImportError:
@@ -87,24 +94,14 @@ except ImportError:
 # Metric helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def dice_score(
-    pred_logit: torch.Tensor,
-    target: torch.Tensor,
-    threshold: float = 0.5,
-    eps: float = 1e-6,
-) -> float:
+def dice_score(pred_logit, target, threshold=0.5, eps=1e-6):
     pred  = (torch.sigmoid(pred_logit) > threshold).float()
     inter = (pred * target).sum(dim=(1, 2, 3))
     denom = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
     return ((2 * inter + eps) / (denom + eps)).mean().item()
 
 
-def iou_score(
-    pred_logit: torch.Tensor,
-    target: torch.Tensor,
-    threshold: float = 0.5,
-    eps: float = 1e-6,
-) -> float:
+def iou_score(pred_logit, target, threshold=0.5, eps=1e-6):
     pred  = (torch.sigmoid(pred_logit) > threshold).float()
     inter = (pred * target).sum(dim=(1, 2, 3))
     union = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) - inter
@@ -122,10 +119,9 @@ class HD95Meter:
         self.metric = HausdorffDistanceMetric(
             include_background=False, percentile=95, reduction="mean"
         )
-        self.binarize = AsDiscrete(threshold=0.5)
-        self.device   = device
+        self.device = device
 
-    def update(self, pred_logit: torch.Tensor, target: torch.Tensor):
+    def update(self, pred_logit, target):
         if not self._ok:
             return
         pred    = (torch.sigmoid(pred_logit) > 0.5).long()
@@ -134,7 +130,7 @@ class HD95Meter:
         tgt_oh  = torch.cat([1 - tgt,  tgt],  dim=1)
         self.metric(pred_oh.cpu(), tgt_oh.cpu())
 
-    def compute(self) -> float:
+    def compute(self):
         if not self._ok:
             return float("nan")
         val = self.metric.aggregate().item()
@@ -146,19 +142,13 @@ class HD95Meter:
 # Operational benchmarks
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def benchmark_model(
-    model: nn.Module,
-    cfg: Config,
-    label: str = "model",
-) -> dict:
+def benchmark_model(model, cfg, label="model"):
     """Returns GFLOPs, params, latency_ms, gpu_mem_mb."""
     model.eval()
     dummy = torch.randn(1, 3, cfg.img_size, cfg.img_size, device=cfg.device)
 
-    # ── Parameter count ───────────────────────────────────────────────────────
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
 
-    # ── GFLOPs ────────────────────────────────────────────────────────────────
     gflops = float("nan")
     if THOP_OK:
         try:
@@ -167,7 +157,6 @@ def benchmark_model(
         except Exception as e:
             print(f"  [WARN] thop failed for {label}: {e}")
 
-    # ── Latency ───────────────────────────────────────────────────────────────
     warmup    = cfg.benchmark_warmup
     repeats   = cfg.benchmark_repeats
     latencies = []
@@ -186,7 +175,6 @@ def benchmark_model(
     lat_mean = float(np.mean(latencies))
     lat_std  = float(np.std(latencies))
 
-    # ── GPU memory ────────────────────────────────────────────────────────────
     gpu_mem = float("nan")
     if cfg.device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -199,7 +187,7 @@ def benchmark_model(
         "params_M":       round(n_params, 2),
         "gflops":         round(gflops, 3) if not np.isnan(gflops) else "N/A",
         "latency_ms":     round(lat_mean, 2),
-        "latency_std_ms": round(lat_std, 2),
+        "latency_std_ms": round(lat_std,  2),
         "gpu_mem_mb":     round(gpu_mem, 1) if not np.isnan(gpu_mem) else "N/A",
     }
     print(f"  [{label}] params={result['params_M']}M | "
@@ -213,35 +201,12 @@ def benchmark_model(
 # LDL-specific helper: ψ_T warm-up  (Issue 5 fix)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _ldl_warmup_psi_T(
-    kd_loss_fn,
-    teacher:      nn.Module,
-    train_loader,
-    cfg:          Config,
-) -> None:
+def _ldl_warmup_psi_T(kd_loss_fn, teacher, train_loader, cfg):
     """
-    Warm up the teacher adapter ψ_T for cfg.psi_T_warmup_steps gradient
-    steps before freezing it and seeding the anchors via k-means++.
-
-    Why this matters (Issue 5)
-    --------------------------
-    ψ_T is a 1×1 conv that projects teacher features into the D-dimensional
-    embedding space shared with the anchors.  If k-means++ is run on random
-    (untrained) ψ_T embeddings, the anchor positions are meaningless and then
-    become mis-aligned with the embedding space once ψ_T is updated further.
-    The correct sequence is:
-
-        ψ_T warms up  →  freeze ψ_T  →  k-means++ on frozen embeddings
-
-    Warm-up objective
-    -----------------
-    We maximise the per-channel variance of the L2-normalised embeddings.
-    This encourages ψ_T to spread its output across the unit hypersphere
-    (avoiding representational collapse to a single point) and is equivalent
-    to minimising the negative mean variance, a standard anti-collapse loss.
-
-    If cfg.psi_T_warmup_steps == 0 the warm-up is skipped (useful for
-    unit tests and tiny datasets where random initialisation is acceptable).
+    Three-phase initialisation (Issue 5 fix):
+      Phase A: variance-maximising warm-up of ψ_T (~500 gradient steps)
+      Phase B: freeze ψ_T
+      Phase C: k-means++ anchor init on frozen ψ_T embeddings
     """
     warmup_steps = cfg.psi_T_warmup_steps
     if warmup_steps <= 0:
@@ -253,42 +218,30 @@ def _ldl_warmup_psi_T(
     psi_T_opt = optim.Adam(kd_loss_fn.psi_T.parameters(), lr=cfg.lr * 0.1)
 
     teacher.eval()
-    step = 0
-    done = False
-
+    step, done = 0, False
     while not done:
         for imgs, _ in train_loader:
             if step >= warmup_steps:
                 done = True
                 break
-
             imgs = imgs.to(cfg.device, non_blocking=True)
-
             with torch.no_grad():
                 _, ft = get_encoder_feat(teacher, imgs, cfg.distill_feat_idx)
-
             psi_T_opt.zero_grad()
-
-            ft_emb  = kd_loss_fn.psi_T(ft.detach())         # (B, D, H, W)
+            ft_emb  = kd_loss_fn.psi_T(ft.detach())
             B, D, H, W = ft_emb.shape
-            ft_flat = ft_emb.permute(0, 2, 3, 1).reshape(-1, D)   # (B·H·W, D)
+            ft_flat = ft_emb.permute(0, 2, 3, 1).reshape(-1, D)
             ft_norm = F.normalize(ft_flat, dim=1)
-
-            # Variance-maximising loss: −mean(per-channel variance)
-            # Encourages spread across the hypersphere; prevents collapse.
             loss_warmup = -ft_norm.var(dim=0).mean()
             loss_warmup.backward()
             psi_T_opt.step()
             step += 1
 
-    # ── Phase B: freeze ψ_T ──────────────────────────────────────────────────
     kd_loss_fn.freeze_psi_T()
 
-    # ── Phase C: k-means++ anchor initialisation on frozen ψ_T ──────────────
     n_collect = min(10, len(train_loader))
     print(f"  [LDL] Collecting features from {n_collect} batches "
           f"for k-means++ anchor init …")
-    teacher.eval()
     warmup_feats = []
     with torch.no_grad():
         for i, (imgs, _) in enumerate(train_loader):
@@ -298,58 +251,41 @@ def _ldl_warmup_psi_T(
             _, ft   = get_encoder_feat(teacher, imgs, cfg.distill_feat_idx)
             ft_proj = kd_loss_fn.psi_T(ft).detach().cpu()
             warmup_feats.append(ft_proj)
-
     kd_loss_fn.warmup_anchors(warmup_feats)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LDL per-epoch mass update helper
+# LDL per-epoch mass update
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _ldl_update_masses(
-    kd_loss_fn,
-    teacher: nn.Module,
-    val_loader,
-    cfg: Config,
-) -> None:
-    """
-    Recompute anchor masses m_i ← |C_i(w) ∩ Ω| / |Ω| using the validation
-    loader (Theorem 3.5).  Called once per epoch before training starts.
-    Uses the validation set rather than the train set to avoid stale
-    augmented views inflating or deflating cell volumes.
-    """
+def _ldl_update_masses(kd_loss_fn, teacher, val_loader, cfg):
+    """Recompute anchor masses m_i ← |C_i(w) ∩ Ω| / |Ω| (Theorem 3.5)."""
     teacher.eval()
-    C_accum: Optional[torch.Tensor] = None
+    C_accum = None
     cnt = 0
-
     with torch.no_grad():
         for imgs, _ in val_loader:
             imgs    = imgs.to(cfg.device, non_blocking=True)
             _, ft   = get_encoder_feat(teacher, imgs, cfg.distill_feat_idx)
             ft_proj = kd_loss_fn.psi_T(ft)
-
             B, _, H, W = ft.shape
             N = H * W
-
             grid_h = torch.linspace(0, 1, H, device=cfg.device)
             grid_w = torch.linspace(0, 1, W, device=cfg.device)
             gy, gx = torch.meshgrid(grid_h, grid_w, indexing="ij")
             P      = (torch.stack([gy, gx], dim=-1)
                       .reshape(N, 2).unsqueeze(0).expand(B, -1, -1))
-
             ft_flat = ft_proj.permute(0, 2, 3, 1).reshape(B, N, kd_loss_fn.D)
-            F_hat   = torch.cat([ft_flat, P], dim=-1)          # (B, N, D+2)
-            C_batch = kd_loss_fn._cost_matrix(F_hat).mean(0)   # (N, M)
-
+            F_hat   = torch.cat([ft_flat, P], dim=-1)
+            C_batch = kd_loss_fn._cost_matrix(F_hat).mean(0)
             C_accum = C_batch if C_accum is None else C_accum + C_batch
             cnt += 1
-
     if C_accum is not None and cnt > 0:
         kd_loss_fn.update_masses(C_accum / cnt)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# One epoch of training
+# One epoch of training  (Fix 5: epoch param added for λ ramp-up)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(
@@ -362,7 +298,16 @@ def train_one_epoch(
     loader,
     cfg,
     method,
+    epoch: int = 1,           # Fix 5: used to compute ramp-up factor
+    ldl_warmup_done: bool = True,  # Fix 5: ramp starts after warmup
 ):
+    """
+    Fix 5 — λ_LDL ramp-up:
+        For LDL, the effective KD weight scales linearly from 0 → λ_kd over
+        cfg.ldl_lambda_ramp_epochs epochs after the ψ_T warm-up completes.
+        This prevents the abrupt loss spike seen in v2 when the full OT
+        objective was switched on instantly at epoch 25.
+    """
     student.train()
     if teacher is not None:
         teacher.eval()
@@ -390,20 +335,35 @@ def train_one_epoch(
             l_seg = seg_loss_fn(s_logit, masks)
 
             if kd_loss_fn is None or teacher is None:
-                l_kd  = torch.tensor(0.0, device=cfg.device)
-                loss  = l_seg
+                l_kd         = torch.tensor(0.0, device=cfg.device)
+                effective_lam = 0.0
+                loss          = l_seg
+
             elif method == "vanilla":
-                l_kd  = kd_loss_fn(s_logit, t_logit)
-                loss  = l_seg + cfg.lambda_kd * l_kd
+                l_kd          = kd_loss_fn(s_logit, t_logit)
+                effective_lam = cfg.lambda_kd
+                loss          = l_seg + effective_lam * l_kd
+
             elif method in ("fitnets", "at"):
-                l_kd  = kd_loss_fn(s_feat, t_feat)
-                loss  = l_seg + cfg.lambda_kd * l_kd
+                l_kd          = kd_loss_fn(s_feat, t_feat)
+                effective_lam = cfg.lambda_kd
+                loss          = l_seg + effective_lam * l_kd
+
             elif method == "ldl":
-                l_kd  = kd_loss_fn(t_feat, s_feat)
-                loss  = l_seg + cfg.lambda_kd * l_kd
+                l_kd = kd_loss_fn(t_feat, s_feat)
+                # Fix 5: linear ramp-up of λ_LDL after warm-up phase
+                ramp_epochs = max(1, cfg.ldl_lambda_ramp_epochs)
+                if ldl_warmup_done:
+                    ramp_frac = min(1.0, epoch / ramp_epochs)
+                else:
+                    ramp_frac = 0.0
+                effective_lam = cfg.lambda_kd * ramp_frac
+                loss          = l_seg + effective_lam * l_kd
+
             else:
-                l_kd  = torch.tensor(0.0, device=cfg.device)
-                loss  = l_seg
+                l_kd          = torch.tensor(0.0, device=cfg.device)
+                effective_lam = 0.0
+                loss          = l_seg
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -428,28 +388,23 @@ def train_one_epoch(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate(student, loader, cfg):
-    student.eval()
+def evaluate(model, loader, cfg):
+    model.eval()
     seg_loss_fn = SegLoss().to(cfg.device)
     hd95_meter  = HD95Meter(cfg.device)
-
     total_dice = total_iou = total_loss = 0.0
     n = 0
-
     for imgs, masks in loader:
         imgs  = imgs.to(cfg.device,  non_blocking=True)
         masks = masks.to(cfg.device, non_blocking=True)
-
         with autocast(enabled=cfg.amp):
-            logit, _ = get_encoder_feat(student, imgs, -2)
+            logit, _ = get_encoder_feat(model, imgs, -2)
             loss      = seg_loss_fn(logit, masks)
-
         total_dice += dice_score(logit, masks)
         total_iou  += iou_score(logit, masks)
         total_loss += loss.item()
         hd95_meter.update(logit, masks)
         n += 1
-
     return {
         "loss": total_loss / n,
         "dice": total_dice / n,
@@ -459,50 +414,46 @@ def evaluate(student, loader, cfg):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Full training run for one method
+# Full training run for one method and one seed
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_method(method: str, cfg: Config):
-    print(f"\n{'='*60}")
-    print(f"  METHOD: {method.upper()}")
-    print(f"{'='*60}")
+    """
+    Train one (method, seed) pair.
+
+    Checkpoints   : {ckpt_dir}/best_{method}_seed{seed}.pth
+    Training log  : {log_dir}/{method}_seed{seed}_history.csv
+    Per-seed JSON : {results_dir}/{method}_seed{seed}_metrics.json
+    """
+    seed = cfg.seed
+    print(f"\n{'='*65}")
+    print(f"  METHOD: {method.upper()}   SEED: {seed}")
+    print(f"{'='*65}")
 
     train_loader, val_loader, test_loader = build_dataloaders(cfg)
 
-    # ── Build models ──────────────────────────────────────────────────────────
     teacher = build_teacher(cfg)
     student = build_student(cfg)
 
-    # ── Determine feature channel widths ──────────────────────────────────────
+    # Detect feature channel widths dynamically (architecture-agnostic)
     with torch.no_grad():
-        dummy = torch.randn(2, 3, cfg.img_size, cfg.img_size,
-                            device=cfg.device)
+        dummy = torch.randn(2, 3, cfg.img_size, cfg.img_size, device=cfg.device)
         _, t_feat_sample = get_encoder_feat(teacher, dummy, cfg.distill_feat_idx)
         _, s_feat_sample = get_encoder_feat(student, dummy, cfg.distill_feat_idx)
     teacher_ch = t_feat_sample.shape[1]
     student_ch = s_feat_sample.shape[1]
-    print(f"  Teacher distill channels: {teacher_ch}")
-    print(f"  Student distill channels: {student_ch}")
+    print(f"  Teacher distill channels : {teacher_ch}")
+    print(f"  Student distill channels : {student_ch}")
 
-    # ── KD loss module ────────────────────────────────────────────────────────
     kd_loss_fn  = build_kd_loss(method, cfg, teacher_ch, student_ch)
     seg_loss_fn = SegLoss().to(cfg.device)
 
-    # ── LDL initialisation: correct three-phase warmup (Issue 5 fix) ─────────
-    #
-    #   OLD (broken):
-    #       collect features with random ψ_T  →  warmup_anchors()
-    #       → RuntimeError because _psi_T_frozen is still False
-    #
-    #   NEW (correct):
-    #       Phase A: train ψ_T for psi_T_warmup_steps steps (variance-max loss)
-    #       Phase B: freeze_psi_T()              sets _psi_T_frozen = True
-    #       Phase C: collect features, warmup_anchors()  (k-means++ on stable ψ_T)
-    #
+    # LDL three-phase warm-up (Issue 5 fix)
+    ldl_warmup_epoch = 0    # epoch from which the ramp starts (Fix 5)
     if method == "ldl" and kd_loss_fn is not None:
         _ldl_warmup_psi_T(kd_loss_fn, teacher, train_loader, cfg)
+        ldl_warmup_epoch = 1   # ramp-up begins at epoch 1 of joint training
 
-    # ── Optimiser: student params + (optionally) KD params ───────────────────
     params = list(student.parameters())
     if kd_loss_fn is not None:
         params += list(kd_loss_fn.parameters())
@@ -512,8 +463,7 @@ def run_method(method: str, cfg: Config):
     )
     scaler = GradScaler(enabled=cfg.amp)
 
-    # ── CSV logger ────────────────────────────────────────────────────────────
-    csv_path   = os.path.join(cfg.log_dir, f"{method}_history.csv")
+    csv_path   = os.path.join(cfg.log_dir, f"{method}_seed{seed}_history.csv")
     csv_file   = open(csv_path, "w", newline="")
     csv_writer = csv.DictWriter(csv_file, fieldnames=[
         "epoch", "train_loss", "train_seg", "train_kd",
@@ -522,20 +472,24 @@ def run_method(method: str, cfg: Config):
     csv_writer.writeheader()
 
     best_dice  = 0.0
-    best_ckpt  = os.path.join(cfg.ckpt_dir, f"best_{method}.pth")
+    best_ckpt  = os.path.join(cfg.ckpt_dir, f"best_{method}_seed{seed}.pth")
     no_improve = 0
     history    = []
 
-    # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(1, cfg.epochs + 1):
 
-        # LDL: update anchor masses once per epoch after the first
         if method == "ldl" and kd_loss_fn is not None and epoch > 1:
             _ldl_update_masses(kd_loss_fn, teacher, val_loader, cfg)
+
+        # Fix 5: pass epoch number for λ ramp-up computation
+        # epoch_in_joint: how many epochs since joint LDL training started
+        epoch_in_joint = epoch - ldl_warmup_epoch + 1
 
         train_metrics = train_one_epoch(
             teacher, student, kd_loss_fn, seg_loss_fn,
             optimizer, scaler, train_loader, cfg, method,
+            epoch=epoch_in_joint,
+            ldl_warmup_done=(ldl_warmup_epoch > 0),
         )
         val_metrics = evaluate(student, val_loader, cfg)
         scheduler.step(val_metrics["dice"])
@@ -563,7 +517,6 @@ def run_method(method: str, cfg: Config):
                   f"val_iou={row['val_iou']:.4f} | "
                   f"val_hd95={row['val_hd95']}")
 
-        # ── Checkpoint ────────────────────────────────────────────────────────
         if val_metrics["dice"] > best_dice:
             best_dice  = val_metrics["dice"]
             no_improve = 0
@@ -584,7 +537,7 @@ def run_method(method: str, cfg: Config):
     csv_file.close()
     print(f"  Best val Dice: {best_dice:.4f}  →  checkpoint: {best_ckpt}")
 
-    # ── Test evaluation ───────────────────────────────────────────────────────
+    # ── Student test evaluation ───────────────────────────────────────────────
     ckpt = torch.load(best_ckpt, map_location=cfg.device)
     student.load_state_dict(ckpt["student"])
     test_metrics = evaluate(student, test_loader, cfg)
@@ -592,26 +545,96 @@ def run_method(method: str, cfg: Config):
           f"iou={test_metrics['iou']:.4f} | "
           f"hd95={test_metrics['hd95']:.2f}")
 
+    # Fix 3: Teacher test metrics (once per run — teacher has no seed variation)
+    teacher_test = None
+    if method == "none":
+        print("  Evaluating frozen teacher on test set …")
+        teacher_test = evaluate(teacher, test_loader, cfg)
+        print(f"  TEACHER TEST → dice={teacher_test['dice']:.4f} | "
+              f"iou={teacher_test['iou']:.4f} | "
+              f"hd95={teacher_test['hd95']:.2f}")
+
     # ── Operational benchmarks ────────────────────────────────────────────────
     print("\n  --- Operational Benchmarks ---")
     ops_student = benchmark_model(student, cfg, label=f"student_{method}")
-    if method == "none":   # benchmark teacher only once
+    ops_teacher = None
+    if method == "none":
         ops_teacher = benchmark_model(teacher, cfg, label="teacher")
-    else:
-        ops_teacher = None
 
-    return {
+    result = {
         "method":        method,
+        "seed":          seed,
         "best_val_dice": round(best_dice, 4),
         "test_dice":     round(test_metrics["dice"], 4),
         "test_iou":      round(test_metrics["iou"],  4),
         "test_hd95":     (round(test_metrics["hd95"], 3)
                           if not np.isnan(test_metrics["hd95"]) else "N/A"),
-        **{f"student_{k}": v for k, v in ops_student.items()
-           if k != "label"},
+        **{f"student_{k}": v for k, v in ops_student.items() if k != "label"},
+        "teacher_test":  teacher_test,
         "teacher_ops":   ops_teacher,
         "history_csv":   csv_path,
     }
+
+    # Save per-seed metrics JSON
+    os.makedirs(cfg.results_dir, exist_ok=True)
+    per_seed_path = os.path.join(
+        cfg.results_dir, f"{method}_seed{seed}_metrics.json")
+    with open(per_seed_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  Per-seed results → {per_seed_path}")
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-seed aggregation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def aggregate_seed_results(per_seed: List[dict]) -> dict:
+    """
+    Compute mean ± std of test_dice, test_iou, test_hd95 across seeds.
+    Operational metrics (params, GFLOPs, latency) taken from the last seed.
+    """
+    if not per_seed:
+        return {}
+
+    keys   = ["test_dice", "test_iou", "test_hd95"]
+    values = {k: [_safe_float(r[k]) for r in per_seed] for k in keys}
+    agg    = {"method": per_seed[0]["method"],
+              "seeds_run": [r["seed"] for r in per_seed],
+              "n_seeds": len(per_seed)}
+
+    for k, vals in values.items():
+        clean = [v for v in vals if not np.isnan(v)]
+        if clean:
+            agg[f"{k}_mean"] = round(float(np.mean(clean)), 4)
+            agg[f"{k}_std"]  = round(float(np.std(clean)),  4)
+        else:
+            agg[f"{k}_mean"] = "N/A"
+            agg[f"{k}_std"]  = "N/A"
+        # Canonical scalar = mean (for backward-compatible table display)
+        agg[k] = agg[f"{k}_mean"]
+
+    # Carry operational metrics from the last available seed
+    last = per_seed[-1]
+    for k in ("student_params_M", "student_gflops",
+              "student_latency_ms", "student_gpu_mem_mb"):
+        agg[k] = last.get(k, "N/A")
+
+    # Teacher metrics (only present for method="none")
+    if last.get("teacher_test"):
+        agg["teacher_test"] = last["teacher_test"]
+    if last.get("teacher_ops"):
+        agg["teacher_ops"] = last["teacher_ops"]
+
+    return agg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -619,29 +642,156 @@ def run_method(method: str, cfg: Config):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_comparison_table(results: list):
-    print("\n" + "=" * 90)
-    print("  COMPARISON TABLE")
-    print("=" * 90)
-    header = (f"{'Method':<12} {'Dice':>6} {'IoU':>6} {'HD95':>7} "
-              f"{'Params(M)':>10} {'GFLOPs':>8} {'Lat(ms)':>9} {'GPU(MB)':>8}")
-    print(header)
-    print("-" * 90)
-    for r in results:
-        print(f"{r['method']:<12} "
-              f"{r['test_dice']:>6.4f} "
-              f"{r['test_iou']:>6.4f} "
-              f"{str(r['test_hd95']):>7} "
-              f"{r['student_params_M']:>10} "
-              f"{str(r['student_gflops']):>8} "
-              f"{r['student_latency_ms']:>9.1f} "
-              f"{str(r['student_gpu_mem_mb']):>8}")
-    print("=" * 90)
+    """
+    Print a formatted comparison table.  If results include mean±std fields
+    (from multi-seed aggregation), both are shown.
+    """
+    multi = any("test_dice_std" in r for r in results)
 
-    out_path = "./results/comparison_results.json"
+    print("\n" + "=" * 105)
+    print("  COMPARISON TABLE" + ("  (mean ± std across seeds)" if multi else ""))
+    print("=" * 105)
+
+    if multi:
+        hdr = (f"{'Method':<12} {'Dice':>14} {'IoU':>14} {'HD95':>14} "
+               f"{'Params(M)':>10} {'GFLOPs':>8} {'Lat(ms)':>9}")
+    else:
+        hdr = (f"{'Method':<12} {'Dice':>6} {'IoU':>6} {'HD95':>7} "
+               f"{'Params(M)':>10} {'GFLOPs':>8} {'Lat(ms)':>9} {'GPU(MB)':>8}")
+    print(hdr)
+    print("-" * 105)
+
+    for r in results:
+        if multi:
+            dice_s = (f"{r.get('test_dice_mean','N/A')}"
+                      f"±{r.get('test_dice_std','N/A')}")
+            iou_s  = (f"{r.get('test_iou_mean','N/A')}"
+                      f"±{r.get('test_iou_std','N/A')}")
+            hd95_s = (f"{r.get('test_hd95_mean','N/A')}"
+                      f"±{r.get('test_hd95_std','N/A')}")
+            print(f"{r['method']:<12} {dice_s:>14} {iou_s:>14} {hd95_s:>14} "
+                  f"{str(r.get('student_params_M','N/A')):>10} "
+                  f"{str(r.get('student_gflops','N/A')):>8} "
+                  f"{str(r.get('student_latency_ms','N/A')):>9}")
+        else:
+            print(f"{r['method']:<12} "
+                  f"{r.get('test_dice','N/A'):>6} "
+                  f"{r.get('test_iou','N/A'):>6} "
+                  f"{str(r.get('test_hd95','N/A')):>7} "
+                  f"{str(r.get('student_params_M','N/A')):>10} "
+                  f"{str(r.get('student_gflops','N/A')):>8} "
+                  f"{r.get('student_latency_ms', 0):>9.1f} "
+                  f"{str(r.get('student_gpu_mem_mb','N/A')):>8}")
+    print("=" * 105)
+
+    # Print teacher metrics if present
+    none_result = next((r for r in results if r.get("method") == "none"), None)
+    if none_result and none_result.get("teacher_test"):
+        tt = none_result["teacher_test"]
+        to = none_result.get("teacher_ops", {})
+        print(f"\n  Teacher (ResNet50-UNet) — reference ceiling:")
+        print(f"    Test dice={tt['dice']:.4f} | iou={tt['iou']:.4f} | "
+              f"hd95={tt['hd95']:.2f} | "
+              f"params={to.get('params_M','N/A')}M | "
+              f"latency={to.get('latency_ms','N/A')}ms")
+
+    out_path = os.path.join("./results", "comparison_results.json")
     os.makedirs("./results", exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n  Full results saved to {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Benchmark-only mode  (Fix 2 & 3: multi-seed aggregation + teacher metrics)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_benchmark_only(cfg: Config):
+    """
+    Scan for all per-seed checkpoint files, evaluate each, aggregate across
+    seeds, and print the final comparison table.
+
+    Fix 2: automatically discovers best_{method}_seed*.pth and groups by method.
+    Fix 3: evaluates the teacher (always deterministic; benchmarked once).
+    """
+    _, _, test_loader = build_dataloaders(cfg)
+
+    agg_results = []
+
+    for method in ALL_METHODS:
+        ckpt_pattern = os.path.join(cfg.ckpt_dir, f"best_{method}_seed*.pth")
+        ckpts = sorted(glob.glob(ckpt_pattern))
+
+        # Backward compat: check for old-style checkpoint (no seed suffix)
+        if not ckpts:
+            legacy = os.path.join(cfg.ckpt_dir, f"best_{method}.pth")
+            if os.path.exists(legacy):
+                ckpts = [legacy]
+
+        if not ckpts:
+            print(f"  [SKIP] No checkpoints found for method={method}")
+            continue
+
+        per_seed = []
+        ops_last = None
+
+        for ckpt_path in ckpts:
+            # Parse seed from filename (e.g. best_none_seed42.pth → 42)
+            basename = os.path.basename(ckpt_path)
+            try:
+                seed_str = basename.replace(f"best_{method}_seed", "").replace(".pth", "")
+                seed_val = int(seed_str)
+            except ValueError:
+                seed_val = 0   # legacy checkpoint without seed
+
+            student = build_student(cfg)
+            ckpt    = torch.load(ckpt_path, map_location=cfg.device)
+            student.load_state_dict(ckpt["student"])
+
+            tm = evaluate(student, test_loader, cfg)
+
+            if ops_last is None:
+                ops_last = benchmark_model(student, cfg,
+                                           label=f"student_{method}")
+
+            per_seed.append({
+                "method":            method,
+                "seed":              seed_val,
+                "test_dice":         round(tm["dice"], 4),
+                "test_iou":          round(tm["iou"],  4),
+                "test_hd95":         (round(tm["hd95"], 3)
+                                      if not np.isnan(tm["hd95"]) else "N/A"),
+                **{f"student_{k}": v for k, v in ops_last.items()
+                   if k != "label"},
+            })
+            print(f"  [{method} seed={seed_val}] "
+                  f"dice={tm['dice']:.4f} iou={tm['iou']:.4f} "
+                  f"hd95={tm['hd95']:.2f}")
+
+        agg = aggregate_seed_results(per_seed)
+
+        # Fix 3: teacher metrics for 'none' method
+        if method == "none":
+            teacher = build_teacher(cfg)
+            print("  Evaluating teacher on test set …")
+            tt = evaluate(teacher, test_loader, cfg)
+            ops_t = benchmark_model(teacher, cfg, label="teacher")
+            agg["teacher_test"] = {
+                "dice": round(tt["dice"], 4),
+                "iou":  round(tt["iou"],  4),
+                "hd95": (round(tt["hd95"], 3)
+                          if not np.isnan(tt["hd95"]) else "N/A"),
+            }
+            agg["teacher_ops"] = ops_t
+
+        agg_results.append(agg)
+
+    if agg_results:
+        print_comparison_table(agg_results)
+    else:
+        print("  No checkpoints found.  Run training first.")
+
+    return agg_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -656,17 +806,15 @@ def parse_args():
     p.add_argument("--method", default="ldl",
                    choices=ALL_METHODS + ["all"],
                    help="KD method to run (or 'all' for full comparison)")
-    p.add_argument("--data_root",  default="./BUSI",
-                   help="Path to BUSI dataset root")
-    p.add_argument("--epochs",     type=int,   default=None,
-                   help="Override Config.epochs")
-    p.add_argument("--batch_size", type=int,   default=None,
-                   help="Override Config.batch_size")
-    p.add_argument("--lambda_kd",  type=float, default=None,
-                   help="Override Config.lambda_kd")
+    p.add_argument("--data_root",  default="./BUSI")
+    p.add_argument("--epochs",     type=int,   default=None)
+    p.add_argument("--batch_size", type=int,   default=None)
+    p.add_argument("--lambda_kd",  type=float, default=None)
     p.add_argument("--benchmark_only", action="store_true",
-                   help="Only benchmark saved checkpoints (skip training)")
-    p.add_argument("--seed", type=int, default=42)
+                   help="Aggregate all saved checkpoints and print results")
+    # Fix 2: single seed per invocation; call script multiple times for multi-seed
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed for this training run (default: 42)")
     return p.parse_args()
 
 
@@ -680,38 +828,22 @@ def main():
     if args.lambda_kd  is not None: cfg.lambda_kd  = args.lambda_kd
     cfg.seed = args.seed
 
+    # Seed everything reproducibly
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
 
     print(f"\n  Device : {cfg.device}")
     print(f"  AMP    : {cfg.amp}")
     print(f"  Epochs : {cfg.epochs}")
     print(f"  Batch  : {cfg.batch_size}")
+    print(f"  Seed   : {cfg.seed}")
+    print(f"  Teacher: {cfg.teacher_encoder}")
+    print(f"  Student: {cfg.student_encoder}")
 
     if args.benchmark_only:
-        results = []
-        for m in ALL_METHODS:
-            ckpt_path = os.path.join(cfg.ckpt_dir, f"best_{m}.pth")
-            if not os.path.exists(ckpt_path):
-                print(f"  [SKIP] No checkpoint for {m}")
-                continue
-            student = build_student(cfg)
-            ckpt    = torch.load(ckpt_path, map_location=cfg.device)
-            student.load_state_dict(ckpt["student"])
-            ops = benchmark_model(student, cfg, label=f"student_{m}")
-            _, _, test_loader = build_dataloaders(cfg)
-            tm = evaluate(student, test_loader, cfg)
-            results.append({
-                "method":    m,
-                "test_dice": round(tm["dice"], 4),
-                "test_iou":  round(tm["iou"],  4),
-                "test_hd95": (round(tm["hd95"], 3)
-                              if not np.isnan(tm["hd95"]) else "N/A"),
-                **{f"student_{k}": v for k, v in ops.items() if k != "label"},
-                "teacher_ops": None,
-            })
-        if results:
-            print_comparison_table(results)
+        run_benchmark_only(cfg)
         return
 
     methods = ALL_METHODS if args.method == "all" else [args.method]

@@ -1,5 +1,5 @@
 """
-ldl_layer.py — Laguerre Distillation Layer (LDL)  [Revised v2]
+ldl_layer_v2.py — Laguerre Distillation Layer (LDL)  [Revised v2 — used with v3 config]
 
 Implements Algorithms 1–3 from the proposal, grounded in:
   Chung, Han, Li, Li. "Unbalanced Optimal Total Variation Transport." NeurIPS 2025.
@@ -54,6 +54,13 @@ Issue 5 [SIGNIFICANT] — k-means++ runs BEFORE ψ_T warm-up
     FIX: warmup_anchors() must be called AFTER ψ_T is frozen (i.e., after
          the warm-up phase). A runtime guard (_psi_T_frozen flag) enforces
          this and raises a descriptive error if violated.
+
+v3 config note (no code changes to this module):
+    embed_dim   default 128 → 256 in Config (passed at construction time)
+    num_anchors default 32  → 64  in Config (passed at construction time)
+    These values are controlled by cfg.ldl_embed_dim / cfg.ldl_num_anchors
+    and forwarded through build_kd_loss() in models_and_kd_v2.py.
+    The module accepts any (embed_dim, num_anchors) pair; no internal change.
 ─────────────────────────────────────────────────────────────────────────────
 """
 

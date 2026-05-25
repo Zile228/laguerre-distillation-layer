@@ -1,19 +1,37 @@
 """
 models_and_kd_v2.py — Model Factory + All KD Baseline Losses
+
 Architectures:
-  Teacher : ResNet34-UNet   (~24M params, ResNet34 encoder)
-  Student : MobileV2-UNet   (~4M  params, MobileNetV2 encoder)  ← edge-deployable
+  Teacher : ResNet50-UNet   (~32 M params, ResNet50 encoder)  ← upgraded from ResNet34
+  Student : ShuffleNetV2-x1.0-UNet (~3.5 M params)           ← replaces MobileNetV2
+            Accessed via SMP timm integration (encoder_name='tu-shufflenet_v2_x1_0').
+            ShuffleNetV2 x1.0 is ~15 % faster than MobileNetV2 on ARM/NPU hardware
+            and supports channel-shuffle-aware INT8 quantisation.
+
 KD Baselines:
   VanillaKD  — Hinton et al. (2015), soft logit matching
   FitNets    — Romero et al. (2014), intermediate feature L2
   AT         — Zagoruyko & Komodakis (2017), attention map matching
 
-Fix log:
-  VanillaKDLoss.forward() — binary_cross_entropy() is not AMP-safe because
-    torch autocast reduces sigmoid outputs to float16, but BCE requires float32
-    inputs to avoid numerical instability.  The fix casts both tensors to
-    float32 explicitly before the loss computation while still benefiting from
-    the reduced-precision forward pass for everything else.
+Fix log (v2 → v3):
+─────────────────────────────────────────────────────────────────────────────
+Fix 1  [VanillaKD T² loss imbalance]
+    OLD: VanillaKDLoss.forward() returned BCE(s, p_t) * T²
+         The T² factor (from Hinton 2015) compensates for gradient magnitude
+         reduction in *multi-class softmax* distillation.  For binary sigmoid
+         segmentation, T²=16 at T=4 inflates the KD term by 16×, completely
+         dominating the segmentation loss (observed: total loss ~6.2, never
+         converging; val Dice 0.757 < standalone student 0.814).
+    FIX: T² multiplier removed from VanillaKDLoss.  Temperature T still
+         softens teacher labels; λ_kd alone controls the KD/seg balance.
+         cfg.temperature is now 2.0 (was 4.0) as an additional safeguard.
+         At T=2 the BCE magnitude (~0.5–0.7) is comparable to SegLoss,
+         and λ_kd=0.5 gives a balanced total loss.
+
+AMP safety (carried forward from v2):
+    VanillaKDLoss uses F.binary_cross_entropy_with_logits (AMP-safe) not
+    F.binary_cross_entropy (AMP-unsafe under torch.autocast float16).
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import torch
@@ -27,27 +45,42 @@ from typing import Dict, Optional, Tuple
 # MODEL FACTORY
 # ================================================================
 def build_teacher(cfg) -> nn.Module:
-    """ResNet34-UNet: strong teacher, ~24M params."""
+    """
+    ResNet50-UNet teacher.
+
+    ResNet50 distillation channels (feat_idx=-2):
+      encoder.features[-2] = Layer3 → 1024 channels at H/16 × W/16.
+    Total params with UNet decoder (256,128,64,32,16): ~32 M.
+    """
     model = smp.Unet(
-        encoder_name=cfg.teacher_encoder,
-        encoder_weights=cfg.encoder_weights,
+        encoder_name=cfg.teacher_encoder,        # "resnet50"
+        encoder_weights=cfg.encoder_weights,     # "imagenet"
         in_channels=3,
         classes=1,
-        activation=None,          # raw logits; sigmoid applied inside loss
+        activation=None,
         decoder_channels=(256, 128, 64, 32, 16),
     )
     return model.to(cfg.device)
 
 
 def build_student(cfg) -> nn.Module:
-    """MobileNetV2-UNet: compact student, ~4M params, INT8-quantizable."""
+    """
+    ShuffleNetV2 x1.0-UNet student.
+
+    ShuffleNetV2 x1.0 distillation channels (feat_idx=-2):
+      Stage3 output → ~232 channels (auto-detected at runtime in run_method).
+    Total params with UNet decoder (128,64,32,16,8): ~3.5 M.
+
+    The 'tu-' prefix uses SMP's timm-backed encoder registry (SMP >= 0.3.3).
+    encoder_weights="imagenet" downloads timm pretrained weights automatically.
+    """
     model = smp.Unet(
-        encoder_name=cfg.student_encoder,
+        encoder_name=cfg.student_encoder,        # "tu-shufflenet_v2_x1_0"
         encoder_weights=cfg.encoder_weights,
         in_channels=3,
         classes=1,
         activation=None,
-        decoder_channels=(128, 64, 32, 16, 8),  # lighter decoder for edge
+        decoder_channels=(128, 64, 32, 16, 8),
     )
     return model.to(cfg.device)
 
@@ -63,17 +96,15 @@ def get_encoder_feat(
     feat_idx selects which encoder feature level to use for distillation
     (-2 = penultimate encoder block).  Handles both old and new SMP APIs.
     """
-    features = model.encoder(x)          # list of tensors
-    feat_map = features[feat_idx]         # (B, C, H', W')
+    features = model.encoder(x)
+    feat_map  = features[feat_idx]
 
-    # SMP version compatibility: older API unpacks features as *args,
-    # newer API accepts a single list argument.
     try:
         decoder_out = model.decoder(*features)
     except TypeError:
         decoder_out = model.decoder(features)
 
-    logit = model.segmentation_head(decoder_out)   # (B, 1, H, W)
+    logit = model.segmentation_head(decoder_out)
     return logit, feat_map
 
 
@@ -87,7 +118,7 @@ class SegLoss(nn.Module):
         super().__init__()
         self.bce_weight  = bce_weight
         self.dice_weight = 1.0 - bce_weight
-        self.bce = nn.BCEWithLogitsLoss()   # AMP-safe; works on logits directly
+        self.bce = nn.BCEWithLogitsLoss()
 
     def dice_loss(
         self,
@@ -115,10 +146,31 @@ class SegLoss(nn.Module):
 # ================================================================
 class VanillaKDLoss(nn.Module):
     """
-    Soft-logit knowledge distillation.
+    Soft-logit knowledge distillation for binary segmentation.
 
-    Computes KL( σ(teacher/T) ‖ σ(student/T) ) scaled by T², applied to
-    the full segmentation output after flattening the spatial dimensions.
+    Temperature T softens the teacher's sigmoid outputs, making the
+    soft labels less peaked and transferring more information about
+    the relative confidence of each spatial prediction.
+
+    Fix 1 — T² scaling removed
+    ───────────────────────────
+    Hinton et al. (2015) multiply the KD loss by T² to compensate for
+    the 1/T² gradient magnitude reduction that occurs through the softmax
+    function in multi-class classification.  For binary segmentation with
+    sigmoid, the same gradient attenuation exists, but the absolute loss
+    magnitude at initialisation is already comparable to SegLoss (~0.693).
+    Multiplying by T² (16 at T=4) inflated the KD term catastrophically,
+    dominating the segmentation objective throughout training and yielding
+    val Dice 0.757 — worse than the standalone student (0.814).
+
+    The T² factor is therefore removed.  λ_kd is the sole control for
+    balancing KD against segmentation.  Temperature is set to T=2.0 in
+    Config (default), providing meaningful label softening with T²=4
+    providing an acceptable remaining scale difference.
+
+    AMP safety: F.binary_cross_entropy_with_logits is used (not
+    F.binary_cross_entropy) because torch.autocast reduces sigmoid outputs
+    to float16 while BCE requires float32 inputs.
     """
 
     def __init__(self, temperature: float = 2.0):
@@ -134,17 +186,15 @@ class VanillaKDLoss(nn.Module):
         s = (student_logit / self.T).reshape(B, -1)
         t = (teacher_logit / self.T).reshape(B, -1).detach()
 
-        # Binary segmentation → sigmoid soft labels (chỉ tính cho teacher)
+        # Teacher soft labels
         p_t = torch.sigmoid(t)
 
-        # ── AMP-safe BCE ────────────────────────────────────────────────────
-        # F.binary_cross_entropy bị cấm tuyệt đối khi dùng PyTorch autocast.
-        # Sử dụng F.binary_cross_entropy_with_logits thay thế (AMP-safe) 
-        # bằng cách truyền trực tiếp logit của student (s).
+        # AMP-safe BCE with logits; T² multiplier intentionally absent
+        # (see class docstring for full justification).
         loss = F.binary_cross_entropy_with_logits(
             s, p_t.float(), reduction="mean"
         )
-        return loss * (self.T ** 2)
+        return loss
 
 
 # ================================================================
@@ -188,7 +238,7 @@ class ATLoss(nn.Module):
     """
     Attention map matching.
     Attention map A(F) = L2-normalised sum of squared channel activations.
-    Loss = ‖ A(teacher) − A(student) ‖₂
+    Loss = ‖A(teacher) − A(student)‖₂
     """
 
     def __init__(self):
@@ -197,7 +247,7 @@ class ATLoss(nn.Module):
     @staticmethod
     def attention_map(feat: torch.Tensor) -> torch.Tensor:
         """feat: (B, C, H, W) → attention: (B, 1, H, W), L2-normalised."""
-        a      = feat.pow(2).sum(dim=1, keepdim=True)   # (B, 1, H, W)
+        a      = feat.pow(2).sum(dim=1, keepdim=True)
         a_flat = a.reshape(a.shape[0], -1)
         a_norm = a_flat / (a_flat.norm(dim=1, keepdim=True) + 1e-8)
         return a_norm.reshape_as(a)
@@ -243,13 +293,12 @@ def build_kd_loss(
         return ATLoss().to(cfg.device)
 
     elif method == "ldl":
-        # Revised LDL module (ldl_layer_v2) with five reviewer fixes applied.
         from ldl_layer_v2 import LaguerreDistillationLayer
         return LaguerreDistillationLayer(
             teacher_channels = teacher_ch,
             student_channels = student_ch,
-            embed_dim        = cfg.ldl_embed_dim,
-            num_anchors      = cfg.ldl_num_anchors,
+            embed_dim        = cfg.ldl_embed_dim,      # 256 (Fix 4)
+            num_anchors      = cfg.ldl_num_anchors,    # 64  (Fix 4)
             alpha            = cfg.ldl_alpha,
             k                = cfg.ldl_k,
             a1               = cfg.ldl_a1,
@@ -260,7 +309,7 @@ def build_kd_loss(
             eta0             = cfg.ldl_eta0,
             beta             = cfg.ldl_beta,
             anc_reg          = cfg.ldl_anc_reg,
-            anc_reg_tau      = cfg.ldl_anc_reg_tau,   # Issue 4 fix: soft-min τ
+            anc_reg_tau      = cfg.ldl_anc_reg_tau,
             device           = cfg.device,
         ).to(cfg.device)
 
